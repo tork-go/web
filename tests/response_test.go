@@ -248,3 +248,77 @@ func TestResponderFailingAfterItHasWrittenIsOnlyLogged(t *testing.T) {
 		t.Errorf("body = %q, want only what was written before the failure", rec.Body.String())
 	}
 }
+
+func TestRawResponseWritesContentTypeAndBody(t *testing.T) {
+	app := newApp()
+	app.GET("/export.csv", func(context.Context) (tork.RawResponse, error) {
+		return tork.Raw("text/csv", []byte("a,b\n1,2\n")), nil
+	})
+
+	rec := do(t, app, "GET", "/export.csv", nil)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/csv" {
+		t.Errorf("content type = %q", got)
+	}
+	if got := rec.Body.String(); got != "a,b\n1,2\n" {
+		t.Errorf("body = %q", got)
+	}
+}
+
+// WithStatus and a chained WithHeader together prove RawResponse offers the
+// same fluent path Response does, not a narrower one.
+func TestRawResponseWithStatusAndHeader(t *testing.T) {
+	app := newApp()
+	app.GET("/", func(context.Context) (tork.RawResponse, error) {
+		return tork.Raw("application/octet-stream", []byte{1, 2, 3}).
+			WithStatus(http.StatusAccepted).
+			WithHeader("X-Checksum", "abc").
+			WithHeader("X-Trace", "def"), nil
+	})
+
+	rec := do(t, app, "GET", "/", nil)
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("status = %d", rec.Code)
+	}
+	if got := rec.Header().Get("X-Checksum"); got != "abc" {
+		t.Errorf("X-Checksum = %q", got)
+	}
+	if got := rec.Header().Get("X-Trace"); got != "def" {
+		t.Errorf("X-Trace = %q", got)
+	}
+	if rec.Body.Bytes()[1] != 2 {
+		t.Errorf("body = %v", rec.Body.Bytes())
+	}
+}
+
+// ResponseSpec is asked about a zero-valued RawResponse, not the one a
+// handler actually returns, so it can say the status (RawResponse defaults
+// to 200 the same way Response does) but not the content type, which has no
+// default to fall back on and so is genuinely unknown until a request
+// happens.
+func TestRouteResponseSpecForRawResponseHasNoContentTypeOrBodyType(t *testing.T) {
+	app := newApp()
+	app.GET("/", func(context.Context) (tork.RawResponse, error) {
+		return tork.Raw("text/csv", nil), nil
+	})
+
+	routes, err := app.Routes()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	spec := routes[0].ResponseSpec
+	if spec == nil {
+		t.Fatal("ResponseSpec is nil")
+	}
+	if spec.Status != http.StatusOK {
+		t.Errorf("status = %d, want the documented default 200", spec.Status)
+	}
+	if spec.ContentType != "" {
+		t.Errorf("content type = %q, want empty since it is unknown before a request", spec.ContentType)
+	}
+	if spec.BodyType != nil {
+		t.Errorf("body type = %v, want nil", spec.BodyType)
+	}
+}

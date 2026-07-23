@@ -115,7 +115,7 @@ func (r Response[T]) resolvedStatus() int {
 // the OpenAPI document names it beside this default.
 func (r Response[T]) Spec() ResponseSpec {
 	return ResponseSpec{
-		Status:      http.StatusOK,
+		Status:      r.resolvedStatus(),
 		ContentType: contentTypeJSON,
 		BodyType:    reflect.TypeFor[T](),
 	}
@@ -140,4 +140,73 @@ func cloneHeader(h http.Header) http.Header {
 		return http.Header{}
 	}
 	return h.Clone()
+}
+
+// RawResponse is a body the handler has already reduced to bytes, with a
+// content type of its own choosing — anything JSON is not the right wire
+// format for: CSV, an image, a signed download link, a legacy XML feed.
+//
+//	func exportCSV(ctx context.Context, in ExportInput) (tork.RawResponse, error) {
+//	    return tork.Raw("text/csv", buildCSV(rows)), nil
+//	}
+type RawResponse struct {
+	// Body is written exactly as given; nothing here marshals it.
+	Body []byte
+	// ContentType is the response's Content-Type.
+	ContentType string
+	// Status is the response's status code. Zero resolves to 200.
+	Status int
+	// Headers are written on the response in addition to Content-Type.
+	Headers http.Header
+}
+
+// Raw builds a RawResponse with the given content type and body.
+func Raw(contentType string, body []byte) RawResponse {
+	return RawResponse{ContentType: contentType, Body: body}
+}
+
+// WithStatus replaces the status and returns the response.
+func (r RawResponse) WithStatus(status int) RawResponse {
+	r.Status = status
+	return r
+}
+
+// WithHeader adds one header and returns the response. See Response's
+// WithHeader for why the header map is cloned rather than written into in
+// place.
+func (r RawResponse) WithHeader(key, value string) RawResponse {
+	r.Headers = cloneHeader(r.Headers)
+	r.Headers.Set(key, value)
+	return r
+}
+
+// resolvedStatus is the status RawResponse actually answers with. See
+// Response.resolvedStatus for why Spec and WriteResponse share it.
+func (r RawResponse) resolvedStatus() int {
+	if r.Status == 0 {
+		return http.StatusOK
+	}
+	return r.Status
+}
+
+// Spec reports the default status, 200, for the same reason Response's
+// does: the real value lives on the instance. ContentType has no default to
+// fall back on the way Status does, so a zero-valued RawResponse — which is
+// what Spec is always asked about — reports it empty; a route that always
+// answers with the same content type should also declare it with Responds.
+// BodyType is nil because Body is already bytes, with no Go type behind it
+// worth naming in a schema.
+func (r RawResponse) Spec() ResponseSpec {
+	return ResponseSpec{
+		Status:      r.resolvedStatus(),
+		ContentType: r.ContentType,
+		BodyType:    nil,
+	}
+}
+
+// WriteResponse writes Body as given; there is nothing to marshal, so unlike
+// Response's this call cannot fail before it has written anything, only
+// while writing, and only when the client has gone away.
+func (r RawResponse) WriteResponse(w http.ResponseWriter, _ *http.Request) error {
+	return writeBody(w, r.resolvedStatus(), r.ContentType, r.Headers, r.Body)
 }
