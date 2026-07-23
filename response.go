@@ -2,8 +2,13 @@ package tork
 
 import (
 	"encoding/json"
+	"io"
+	"maps"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"reflect"
+	"strconv"
 )
 
 // ResponseSpec is what a Responder type promises about every value of that
@@ -209,4 +214,99 @@ func (r RawResponse) Spec() ResponseSpec {
 // while writing, and only when the client has gone away.
 func (r RawResponse) WriteResponse(w http.ResponseWriter, _ *http.Request) error {
 	return writeBody(w, r.resolvedStatus(), r.ContentType, r.Headers, r.Body)
+}
+
+// FileResponse is a body read from an io.Reader rather than held in memory
+// at once, with a filename that becomes a download's suggested name rather
+// than a field in a JSON object.
+//
+//	func downloadInvoice(ctx context.Context, in InvoiceInput) (tork.FileResponse, error) {
+//	    f, size := openInvoice(in.InvoiceID)
+//	    return tork.File(in.InvoiceID+".pdf", f).WithSize(size), nil
+//	}
+type FileResponse struct {
+	// Reader is drained, in order, as the response body.
+	Reader io.Reader
+	// Filename becomes the suggested name in Content-Disposition.
+	Filename string
+	// ContentType is the response's Content-Type. Left empty, it is guessed
+	// from Filename's extension, falling back to application/octet-stream
+	// when nothing recognises it.
+	ContentType string
+	// Size, when known, becomes Content-Length so a client can show
+	// progress; left unset, the response is written without one.
+	Size Optional[int64]
+	// Headers are written on the response in addition to the ones above.
+	Headers http.Header
+}
+
+// File builds a FileResponse for r, suggested to be saved as name.
+func File(name string, r io.Reader) FileResponse {
+	return FileResponse{Reader: r, Filename: name}
+}
+
+// WithContentType replaces the guessed content type and returns the
+// response.
+func (f FileResponse) WithContentType(contentType string) FileResponse {
+	f.ContentType = contentType
+	return f
+}
+
+// WithSize sets Content-Length and returns the response.
+func (f FileResponse) WithSize(size int64) FileResponse {
+	f.Size = Some(size)
+	return f
+}
+
+// WithHeader adds one header and returns the response. See Response's
+// WithHeader for why the header map is cloned rather than written into in
+// place.
+func (f FileResponse) WithHeader(key, value string) FileResponse {
+	f.Headers = cloneHeader(f.Headers)
+	f.Headers.Set(key, value)
+	return f
+}
+
+// resolvedContentType is what FileResponse actually answers with: what
+// ContentType says, what Filename's extension guesses, or the one content
+// type that always means "some bytes, meaning unknown" when neither says
+// anything.
+func (f FileResponse) resolvedContentType() string {
+	if f.ContentType != "" {
+		return f.ContentType
+	}
+	if guessed := mime.TypeByExtension(filepath.Ext(f.Filename)); guessed != "" {
+		return guessed
+	}
+	return "application/octet-stream"
+}
+
+// Spec reports the default status, 200. ContentType and BodyType are left
+// unset for the same reason RawResponse's are: Filename and ContentType
+// live on the instance, and Spec is only ever asked about a zero one.
+func (f FileResponse) Spec() ResponseSpec {
+	return ResponseSpec{Status: http.StatusOK}
+}
+
+// WriteResponse writes the headers — including Content-Disposition, and
+// Content-Length when Size is known — before draining Reader into the
+// response body.
+//
+// Unlike Response's or RawResponse's, this call can fail after it has
+// already written something: there is no way to marshal a reader ahead of
+// time the way a value already in memory can be, so a reader that fails
+// partway leaves a response already begun. serve answers that the same way
+// it answers any Responder that fails after starting — by logging it, since
+// the status line is already on the wire.
+func (f FileResponse) WriteResponse(w http.ResponseWriter, _ *http.Request) error {
+	h := w.Header()
+	maps.Copy(h, f.Headers)
+	h.Set("Content-Type", f.resolvedContentType())
+	h.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": f.Filename}))
+	if size, ok := f.Size.Get(); ok {
+		h.Set("Content-Length", strconv.FormatInt(size, 10))
+	}
+	w.WriteHeader(http.StatusOK)
+	_, err := io.Copy(w, f.Reader)
+	return err
 }

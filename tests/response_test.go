@@ -322,3 +322,139 @@ func TestRouteResponseSpecForRawResponseHasNoContentTypeOrBodyType(t *testing.T)
 		t.Errorf("body type = %v, want nil", spec.BodyType)
 	}
 }
+
+func TestFileResponseGuessesContentTypeFromTheExtension(t *testing.T) {
+	app := newApp()
+	app.GET("/download", func(context.Context) (tork.FileResponse, error) {
+		return tork.File("invoice.pdf", strings.NewReader("PDF-DATA")), nil
+	})
+
+	rec := do(t, app, "GET", "/download", nil)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/pdf" {
+		t.Errorf("content type = %q", got)
+	}
+	if got := rec.Header().Get("Content-Disposition"); got != `attachment; filename=invoice.pdf` {
+		t.Errorf("content disposition = %q", got)
+	}
+	if rec.Body.String() != "PDF-DATA" {
+		t.Errorf("body = %q", rec.Body)
+	}
+}
+
+// A filename with a space needs quoting to stay one value in the header;
+// unlike invoice.pdf above, this is where hand-rolling the header would be
+// easy to get wrong.
+func TestFileResponseQuotesAFilenameThatNeedsIt(t *testing.T) {
+	app := newApp()
+	app.GET("/download", func(context.Context) (tork.FileResponse, error) {
+		return tork.File("year end report.pdf", strings.NewReader("x")), nil
+	})
+
+	rec := do(t, app, "GET", "/download", nil)
+	if got := rec.Header().Get("Content-Disposition"); got != `attachment; filename="year end report.pdf"` {
+		t.Errorf("content disposition = %q", got)
+	}
+}
+
+func TestFileResponseWithUnrecognisedExtensionFallsBackToOctetStream(t *testing.T) {
+	app := newApp()
+	app.GET("/download", func(context.Context) (tork.FileResponse, error) {
+		return tork.File("data.unrecognised-extension", strings.NewReader("bytes")), nil
+	})
+
+	rec := do(t, app, "GET", "/download", nil)
+	if got := rec.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Errorf("content type = %q", got)
+	}
+}
+
+// WithContentType overrides the guess, and chaining WithSize and WithHeader
+// after it proves the fluent path is not limited to one addition at a time.
+func TestFileResponseWithContentTypeSizeAndHeader(t *testing.T) {
+	app := newApp()
+	app.GET("/download", func(context.Context) (tork.FileResponse, error) {
+		return tork.File("data.bin", strings.NewReader("12345")).
+			WithContentType("application/x-custom").
+			WithSize(5).
+			WithHeader("X-Checksum", "abc").
+			WithHeader("X-Trace", "def"), nil
+	})
+
+	rec := do(t, app, "GET", "/download", nil)
+	if got := rec.Header().Get("Content-Type"); got != "application/x-custom" {
+		t.Errorf("content type = %q", got)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "5" {
+		t.Errorf("content length = %q", got)
+	}
+	if got := rec.Header().Get("X-Checksum"); got != "abc" {
+		t.Errorf("X-Checksum = %q", got)
+	}
+	if got := rec.Header().Get("X-Trace"); got != "def" {
+		t.Errorf("X-Trace = %q", got)
+	}
+}
+
+// failingReader answers some bytes successfully and then always fails,
+// standing in for a file truncated on disk or a stream that drops midway.
+type failingReader struct {
+	remaining []byte
+	err       error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if len(r.remaining) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.remaining)
+	r.remaining = r.remaining[n:]
+	return n, nil
+}
+
+// A reader that fails partway has already sent headers and some of the body
+// by the time it does, so the response is only ever what it managed to send
+// — the same begun-response handling FileResponse shares with every other
+// Responder.
+func TestFileResponseReaderFailingPartwayIsOnlyLogged(t *testing.T) {
+	app := newApp()
+	app.GET("/download", func(context.Context) (tork.FileResponse, error) {
+		reader := &failingReader{remaining: []byte("partial"), err: errors.New("disk error")}
+		return tork.File("report.txt", reader), nil
+	})
+
+	rec := do(t, app, "GET", "/download", nil)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want the status already sent before the reader failed", rec.Code)
+	}
+	if rec.Body.String() != "partial" {
+		t.Errorf("body = %q, want only what was read before the failure", rec.Body.String())
+	}
+}
+
+func TestRouteResponseSpecForFileResponseHasNoContentTypeOrBodyType(t *testing.T) {
+	app := newApp()
+	app.GET("/download", func(context.Context) (tork.FileResponse, error) {
+		return tork.File("report.pdf", strings.NewReader("")), nil
+	})
+
+	routes, err := app.Routes()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	spec := routes[0].ResponseSpec
+	if spec == nil {
+		t.Fatal("ResponseSpec is nil")
+	}
+	if spec.Status != http.StatusOK {
+		t.Errorf("status = %d, want the documented default 200", spec.Status)
+	}
+	if spec.ContentType != "" {
+		t.Errorf("content type = %q, want empty since it is unknown before a request", spec.ContentType)
+	}
+	if spec.BodyType != nil {
+		t.Errorf("body type = %v, want nil", spec.BodyType)
+	}
+}
