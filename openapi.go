@@ -71,6 +71,19 @@ func defaultVersion(routes []*Route) string {
 	return ""
 }
 
+// versionsOf lists the declared versions, in the order their first route was
+// declared. There is no register of versions anywhere else: a version exists
+// because a route says it belongs to one.
+func versionsOf(routes []*Route) []string {
+	var versions []string
+	for _, route := range routes {
+		if route.Version != "" && !slices.Contains(versions, route.Version) {
+			versions = append(versions, route.Version)
+		}
+	}
+	return versions
+}
+
 // document builds one version's description.
 func (a *App) document(routes []*Route, version string) *openapi.Document {
 	cfg := a.docs.resolved()

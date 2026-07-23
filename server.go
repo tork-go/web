@@ -106,7 +106,7 @@ func (s *server) close(ctx context.Context) error {
 // two patterns that overlap without one being more specific, and it says so
 // by panicking, so the panic is turned back into the error the build was
 // collecting.
-func newServer(routes []*Route, base meta, inj *injector, construct bool) (*server, error) {
+func newServer(routes []*Route, base meta, inj *injector, construct bool, docs []docEndpoint) (*server, error) {
 	s := &server{
 		mux:          http.NewServeMux(),
 		now:          base.now,
@@ -171,6 +171,17 @@ func newServer(routes []*Route, base meta, inj *injector, construct bool) (*serv
 		}
 	}
 
+	// The description is registered after the routes, so a path an
+	// application already declared is reported against the description rather
+	// than against the route — the route was there first, and moving the
+	// description is the smaller change.
+	for _, endpoint := range docs {
+		if err := register(s.mux, "GET "+endpoint.path, serveDoc(endpoint)); err != nil {
+			return nil, fmt.Errorf("%s: %w; move it with tork.OpenAPI, or switch it off with tork.NoOpenAPI",
+				endpoint.path, err)
+		}
+	}
+
 	// Every pattern above matches exactly one path, so "/" is left over for
 	// the paths nothing matched. It cannot conflict with any of them — it is
 	// the least specific pattern there is — and it is registered once, so
@@ -178,6 +189,16 @@ func newServer(routes []*Route, base meta, inj *injector, construct bool) (*serv
 	s.mux.Handle("/", http.HandlerFunc(s.notFound))
 
 	return s, nil
+}
+
+// serveDoc answers with a body decided when the application built. Nothing is
+// marshalled per request: the description cannot change while the server runs,
+// because every route it describes was declared before the server existed.
+func serveDoc(endpoint docEndpoint) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", endpoint.contentType)
+		w.Write(endpoint.body)
+	})
 }
 
 // handler is the http.Handler a built server serves as. It is separate from

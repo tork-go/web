@@ -183,7 +183,7 @@ func (a *App) build(construct bool) ([]*Route, http.Handler, *server, error) {
 		return nil, nil, nil, errors.Join(errs...)
 	}
 
-	s, err := newServer(routes, base, inj, construct)
+	s, err := newServer(routes, base, inj, construct, a.documentEndpoints(routes))
 	if err != nil {
 		return nil, nil, nil, err
 	}
