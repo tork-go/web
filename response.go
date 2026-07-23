@@ -2,6 +2,7 @@ package tork
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"mime"
@@ -389,4 +390,95 @@ func (f flushingWriter) Write(p []byte) (int, error) {
 		f.flusher.Flush()
 	}
 	return n, err
+}
+
+// redirectStatuses is the one thing about a Redirect that is not per
+// instance: the set of statuses HTTP gives a Location header a meaning for.
+// Anything else is refused when the response is written, since nothing
+// about an arbitrary int says which redirect semantics the caller meant.
+var redirectStatuses = map[int]bool{
+	http.StatusMovedPermanently:  true, // 301, permanent, method may change
+	http.StatusFound:             true, // 302, temporary, method may change
+	http.StatusSeeOther:          true, // 303, always fetch with GET
+	http.StatusTemporaryRedirect: true, // 307, temporary, method preserved
+	http.StatusPermanentRedirect: true, // 308, permanent, method preserved
+}
+
+// Redirect answers with a Location and no body of its own.
+//
+//	func legacyItem(ctx context.Context, in LegacyItemInput) (tork.Redirect, error) {
+//	    return tork.PermanentRedirect("/items/" + in.ItemID), nil
+//	}
+//
+// The named constructors below exist because 301, 302, 303, 307, and 308
+// disagree about whether the redirect is permanent and whether a client may
+// change its method, and a bare number says neither; RedirectTo is there
+// for the rare case that already has a status in hand, such as one read
+// back out of Responds.
+type Redirect struct {
+	// Status is one of 301, 302, 303, 307, or 308.
+	Status int
+	// URL becomes the Location header, absolute or relative.
+	URL string
+}
+
+// RedirectTo builds a Redirect with an explicit status.
+func RedirectTo(status int, url string) Redirect {
+	return Redirect{Status: status, URL: url}
+}
+
+// MovedPermanently answers 301: the resource now lives at URL for good, and
+// a client may switch a POST to a GET when it follows this.
+func MovedPermanently(url string) Redirect {
+	return Redirect{Status: http.StatusMovedPermanently, URL: url}
+}
+
+// Found answers 302: the resource is at URL for now, and a client may
+// switch a POST to a GET when it follows this — the same method latitude as
+// MovedPermanently, but without saying the move is permanent.
+func Found(url string) Redirect {
+	return Redirect{Status: http.StatusFound, URL: url}
+}
+
+// SeeOther answers 303: fetch URL with GET regardless of what this request
+// was, which is the redirect a POST handler wants when it sends the client
+// on to a result rather than answering with one directly.
+func SeeOther(url string) Redirect {
+	return Redirect{Status: http.StatusSeeOther, URL: url}
+}
+
+// TemporaryRedirect answers 307: the resource is at URL for now, and a
+// client must repeat this request's method and body there rather than
+// switching to GET.
+func TemporaryRedirect(url string) Redirect {
+	return Redirect{Status: http.StatusTemporaryRedirect, URL: url}
+}
+
+// PermanentRedirect answers 308: the resource now lives at URL for good,
+// and a client must repeat this request's method and body there rather than
+// switching to GET.
+func PermanentRedirect(url string) Redirect {
+	return Redirect{Status: http.StatusPermanentRedirect, URL: url}
+}
+
+// Spec reports nothing: Redirect's real status is chosen per instance from
+// five genuinely different ones, and there is no default among them the way
+// there is a natural 200 for Response. A route that answers with Redirect
+// should declare the status or statuses it actually uses with Responds, so
+// the OpenAPI document says something rather than nothing about it.
+func (r Redirect) Spec() ResponseSpec {
+	return ResponseSpec{}
+}
+
+// WriteResponse refuses a status outside the five Redirect means something
+// for, rather than sending a Location header a client would not know how to
+// interpret. This is the one check in this file that cannot happen at
+// build: the status lives on the instance, which does not exist yet when
+// compileResults runs.
+func (r Redirect) WriteResponse(w http.ResponseWriter, req *http.Request) error {
+	if !redirectStatuses[r.Status] {
+		return fmt.Errorf("redirect status %d is not one of 301, 302, 303, 307, or 308", r.Status)
+	}
+	http.Redirect(w, req, r.URL, r.Status)
+	return nil
 }

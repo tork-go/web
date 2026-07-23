@@ -618,3 +618,91 @@ func TestRouteResponseSpecForStream(t *testing.T) {
 		t.Errorf("body type = %v, want nil", spec.BodyType)
 	}
 }
+
+func TestRedirectNamedConstructorsAnswerTheirOwnStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		result tork.Redirect
+		status int
+	}{
+		{"MovedPermanently", tork.MovedPermanently("/new"), http.StatusMovedPermanently},
+		{"Found", tork.Found("/new"), http.StatusFound},
+		{"SeeOther", tork.SeeOther("/new"), http.StatusSeeOther},
+		{"TemporaryRedirect", tork.TemporaryRedirect("/new"), http.StatusTemporaryRedirect},
+		{"PermanentRedirect", tork.PermanentRedirect("/new"), http.StatusPermanentRedirect},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := newApp()
+			app.GET("/", func(context.Context) (tork.Redirect, error) { return tt.result, nil })
+
+			rec := do(t, app, "GET", "/", nil)
+			if rec.Code != tt.status {
+				t.Errorf("status = %d, want %d", rec.Code, tt.status)
+			}
+			if got := rec.Header().Get("Location"); got != "/new" {
+				t.Errorf("location = %q", got)
+			}
+		})
+	}
+}
+
+func TestRedirectToAcceptsAnExplicitStatus(t *testing.T) {
+	app := newApp()
+	app.GET("/", func(context.Context) (tork.Redirect, error) {
+		return tork.RedirectTo(http.StatusFound, "/elsewhere"), nil
+	})
+
+	rec := do(t, app, "GET", "/", nil)
+	if rec.Code != http.StatusFound {
+		t.Errorf("status = %d", rec.Code)
+	}
+	if got := rec.Header().Get("Location"); got != "/elsewhere" {
+		t.Errorf("location = %q", got)
+	}
+}
+
+// A status Redirect does not mean anything for cannot be validated until a
+// request produces one, but it still fails cleanly: nothing is written
+// before the check, so the client gets the same envelope any other clean
+// Responder failure does rather than a Location header nobody asked for.
+func TestRedirectRejectsAStatusItDoesNotMeanAnythingFor(t *testing.T) {
+	app := newApp()
+	app.GET("/", func(context.Context) (tork.Redirect, error) {
+		return tork.RedirectTo(http.StatusTeapot, "/elsewhere"), nil
+	})
+
+	rec := do(t, app, "GET", "/", nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if e := decodeError(t, rec); e.Code != "INTERNAL_ERROR" {
+		t.Errorf("code = %q", e.Code)
+	}
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Errorf("location = %q, want none written", got)
+	}
+}
+
+// Redirect's real status depends on which of five genuinely different
+// meanings the handler chose, so Spec — asked about a zero-valued Redirect —
+// can say nothing true about it, unlike Response's natural 200 default.
+func TestRouteResponseSpecForRedirectIsEmpty(t *testing.T) {
+	app := newApp()
+	app.GET("/", func(context.Context) (tork.Redirect, error) {
+		return tork.Found("/new"), nil
+	})
+
+	routes, err := app.Routes()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	spec := routes[0].ResponseSpec
+	if spec == nil {
+		t.Fatal("ResponseSpec is nil")
+	}
+	if *spec != (tork.ResponseSpec{}) {
+		t.Errorf("spec = %+v, want the zero value", *spec)
+	}
+}
