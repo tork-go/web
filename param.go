@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/tork-go/web/openapi"
 )
 
 // param is what every typed field builder is made of: the declaration it is
@@ -27,6 +29,43 @@ type param struct {
 }
 
 func (p param) add(r rule) { p.spec.rules = append(p.spec.rules, r) }
+
+// enumOf widens a typed set of allowed values into what a schema's enum
+// carries, which is a list of whatever the values happen to be.
+func enumOf[T any](allowed []T) []any {
+	values := make([]any, len(allowed))
+	for i, a := range allowed {
+		values[i] = a
+	}
+	return values
+}
+
+// format, pattern, and the other one-liners below are the shapes a schema
+// keyword is written in often enough to name, so a rule's declaration stays
+// one line and reads as the keyword it stands for.
+func format(name string) func(*openapi.Schema) {
+	return func(s *openapi.Schema) { s.Format = name }
+}
+
+func pattern(expression string) func(*openapi.Schema) {
+	return func(s *openapi.Schema) { s.Pattern = expression }
+}
+
+func minimum(v float64) func(*openapi.Schema) {
+	return func(s *openapi.Schema) { s.Minimum = &v }
+}
+
+func maximum(v float64) func(*openapi.Schema) {
+	return func(s *openapi.Schema) { s.Maximum = &v }
+}
+
+func exclusiveMinimum(v float64) func(*openapi.Schema) {
+	return func(s *openapi.Schema) { s.ExclusiveMinimum = &v }
+}
+
+func exclusiveMaximum(v float64) func(*openapi.Schema) {
+	return func(s *openapi.Schema) { s.ExclusiveMaximum = &v }
+}
 
 func (p param) change(t transform) { p.spec.transforms = append(p.spec.transforms, t) }
 
@@ -93,14 +132,16 @@ func (p *StringParam) ToUpper() *StringParam {
 // than bytes so that a name in any script is measured the way its writer would.
 func (p *StringParam) MinLen(n int) *StringParam {
 	p.add(newRule(IssueTooShort, plural("must be at least %d character", n),
-		func(v reflect.Value) bool { return runeLen(v) >= n }))
+		func(v reflect.Value) bool { return runeLen(v) >= n },
+		withSchema(func(s *openapi.Schema) { s.MinLength = &n })))
 	return p
 }
 
 // MaxLen refuses a string longer than n characters.
 func (p *StringParam) MaxLen(n int) *StringParam {
 	p.add(newRule(IssueTooLong, plural("must be at most %d character", n),
-		func(v reflect.Value) bool { return runeLen(v) <= n }))
+		func(v reflect.Value) bool { return runeLen(v) <= n },
+		withSchema(func(s *openapi.Schema) { s.MaxLength = &n })))
 	return p
 }
 
@@ -110,20 +151,24 @@ func (p *StringParam) Range(min, max int) *StringParam { return p.MinLen(min).Ma
 // Len refuses a string that is not exactly n characters.
 func (p *StringParam) Len(n int) *StringParam {
 	p.add(newRule(IssueTooShort, plural("must be exactly %d character", n),
-		func(v reflect.Value) bool { return runeLen(v) == n }))
+		func(v reflect.Value) bool { return runeLen(v) == n },
+		withSchema(func(s *openapi.Schema) { s.MinLength, s.MaxLength = &n, &n })))
 	return p
 }
 
 // NotBlank refuses a value that is only whitespace, which a length rule alone
 // would let through.
 func (p *StringParam) NotBlank() *StringParam {
-	return p.Check(IssueFieldRequired, "must not be blank", isNotBlank)
+	// A pattern is unanchored, so one non-space character anywhere is exactly
+	// what "not only whitespace" means.
+	return p.checked(IssueFieldRequired, "must not be blank", isNotBlank, withSchema(pattern(`\S`)))
 }
 
 // OneOf refuses a value outside the set.
 func (p *StringParam) OneOf(allowed ...string) *StringParam {
 	p.add(newRule(IssueNotInSet, "must be one of "+strings.Join(allowed, ", "),
-		func(v reflect.Value) bool { return slices.Contains(allowed, v.String()) }))
+		func(v reflect.Value) bool { return slices.Contains(allowed, v.String()) },
+		withSchema(func(s *openapi.Schema) { s.Enum = enumOf(allowed) })))
 	return p
 }
 
@@ -137,25 +182,29 @@ func (p *StringParam) Pattern(expression string) *StringParam {
 		return p
 	}
 	p.add(newRule(IssuePatternMismatch, "is not in the form this field accepts",
-		func(v reflect.Value) bool { return compiled.MatchString(v.String()) }))
+		func(v reflect.Value) bool { return compiled.MatchString(v.String()) },
+		withSchema(pattern(expression))))
 	return p
 }
 
 // Contains, HasPrefix, and HasSuffix are the substring rules, for the cases a
 // pattern would be a heavy way to say something simple.
 func (p *StringParam) Contains(substring string) *StringParam {
-	return p.Check(IssuePatternMismatch, "must contain "+substring,
-		func(value string) bool { return strings.Contains(value, substring) })
+	return p.checked(IssuePatternMismatch, "must contain "+substring,
+		func(value string) bool { return strings.Contains(value, substring) },
+		withSchema(pattern(regexp.QuoteMeta(substring))))
 }
 
 func (p *StringParam) HasPrefix(prefix string) *StringParam {
-	return p.Check(IssuePatternMismatch, "must begin with "+prefix,
-		func(value string) bool { return strings.HasPrefix(value, prefix) })
+	return p.checked(IssuePatternMismatch, "must begin with "+prefix,
+		func(value string) bool { return strings.HasPrefix(value, prefix) },
+		withSchema(pattern("^"+regexp.QuoteMeta(prefix))))
 }
 
 func (p *StringParam) HasSuffix(suffix string) *StringParam {
-	return p.Check(IssuePatternMismatch, "must end with "+suffix,
-		func(value string) bool { return strings.HasSuffix(value, suffix) })
+	return p.checked(IssuePatternMismatch, "must end with "+suffix,
+		func(value string) bool { return strings.HasSuffix(value, suffix) },
+		withSchema(pattern(regexp.QuoteMeta(suffix)+"$")))
 }
 
 // The named formats. Each is a rule with its own issue, so a client can tell
@@ -163,101 +212,122 @@ func (p *StringParam) HasSuffix(suffix string) *StringParam {
 
 // Email refuses a value that is not an email address.
 func (p *StringParam) Email() *StringParam {
-	return p.Check(IssueInvalidEmail, "must be an email address", isEmail)
+	return p.checked(IssueInvalidEmail, "must be an email address", isEmail, withSchema(format("email")))
 }
 
 // UUID refuses a value that is not a UUID.
 func (p *StringParam) UUID() *StringParam {
-	return p.Check(IssueInvalidUUID, "must be a UUID", isUUID)
+	return p.checked(IssueInvalidUUID, "must be a UUID", isUUID, withSchema(format("uuid")))
 }
 
 // URL refuses a value that is not an absolute URL.
 func (p *StringParam) URL() *StringParam {
-	return p.Check(IssueInvalidURL, "must be an absolute URL", isURL)
+	return p.checked(IssueInvalidURL, "must be an absolute URL", isURL, withSchema(format("uri")))
 }
 
 // IP, IPv4, and IPv6 refuse a value that is not an address of that family.
+//
+// IP describes nothing in the schema: it accepts either family, and JSON
+// Schema has a format for each but none for the pair.
 func (p *StringParam) IP() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be an IP address", isIP)
+	return p.checked(IssueInvalidFormat, "must be an IP address", isIP)
 }
 
 func (p *StringParam) IPv4() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be an IPv4 address", isIPv4)
+	return p.checked(IssueInvalidFormat, "must be an IPv4 address", isIPv4, withSchema(format("ipv4")))
 }
 
 func (p *StringParam) IPv6() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be an IPv6 address", isIPv6)
+	return p.checked(IssueInvalidFormat, "must be an IPv6 address", isIPv6, withSchema(format("ipv6")))
 }
 
-// CIDR refuses a value that is not an address with a prefix length.
+// CIDR refuses a value that is not an address with a prefix length. There is
+// no JSON Schema format for one, so it describes nothing.
 func (p *StringParam) CIDR() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be an address in CIDR notation", isCIDR)
+	return p.checked(IssueInvalidFormat, "must be an address in CIDR notation", isCIDR)
 }
 
 // Hostname refuses a value that is not a DNS hostname.
 func (p *StringParam) Hostname() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be a hostname", isHostname)
+	return p.checked(IssueInvalidFormat, "must be a hostname", isHostname, withSchema(format("hostname")))
 }
 
 // Semver refuses a value that is not a semantic version.
 func (p *StringParam) Semver() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be a semantic version such as 1.4.0", isSemver)
+	return p.checked(IssueInvalidFormat, "must be a semantic version such as 1.4.0", isSemver,
+		withSchema(pattern(`^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)))
 }
 
 // Slug refuses anything but lower-case letters, digits, and single hyphens.
 func (p *StringParam) Slug() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be a slug, such as summer-sale", isSlug)
+	return p.checked(IssueInvalidFormat, "must be a slug, such as summer-sale", isSlug,
+		withSchema(pattern(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)))
 }
 
 // CreditCard applies the Luhn check, which says a number is well formed. It
-// does not say the card exists.
+// does not say the card exists, and there is no keyword for a checksum, so it
+// describes nothing.
 func (p *StringParam) CreditCard() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be a card number", isCreditCard)
+	return p.checked(IssueInvalidFormat, "must be a card number", isCreditCard)
 }
 
 // Base64 refuses a value that is not standard base64.
 func (p *StringParam) Base64() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be base64", isBase64)
+	return p.checked(IssueInvalidFormat, "must be base64", isBase64,
+		withSchema(func(s *openapi.Schema) { s.ContentEncoding = "base64" }))
 }
 
 // JSON refuses a value that is not a JSON document, for a field that carries
 // one as a string.
 func (p *StringParam) JSON() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be JSON", isJSON)
+	return p.checked(IssueInvalidFormat, "must be JSON", isJSON,
+		withSchema(func(s *openapi.Schema) { s.ContentMediaType = "application/json" }))
 }
 
 // Alpha, Alphanumeric, and Numeric are about letters and digits in the Unicode
-// sense, so a value in any script passes.
+// sense, so a value in any script passes — which is why the patterns they
+// describe are Unicode classes rather than A to Z.
 func (p *StringParam) Alpha() *StringParam {
-	return p.Check(IssueInvalidFormat, "must contain only letters", isAlpha)
+	return p.checked(IssueInvalidFormat, "must contain only letters", isAlpha,
+		withSchema(pattern(`^\p{L}+$`)))
 }
 
 func (p *StringParam) Alphanumeric() *StringParam {
-	return p.Check(IssueInvalidFormat, "must contain only letters and digits", isAlphanumeric)
+	return p.checked(IssueInvalidFormat, "must contain only letters and digits", isAlphanumeric,
+		withSchema(pattern(`^[\p{L}\p{Nd}]+$`)))
 }
 
 func (p *StringParam) Numeric() *StringParam {
-	return p.Check(IssueInvalidFormat, "must contain only digits", isNumeric)
+	return p.checked(IssueInvalidFormat, "must contain only digits", isNumeric,
+		withSchema(pattern(`^\p{Nd}+$`)))
 }
 
 // ASCII refuses anything outside ASCII.
 func (p *StringParam) ASCII() *StringParam {
-	return p.Check(IssueInvalidFormat, "must contain only ASCII characters", isASCII)
+	return p.checked(IssueInvalidFormat, "must contain only ASCII characters", isASCII,
+		withSchema(pattern(`^[\x00-\x7F]*$`)))
 }
 
 // Hex refuses anything but hexadecimal digits.
 func (p *StringParam) Hex() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be hexadecimal", isHex)
+	return p.checked(IssueInvalidFormat, "must be hexadecimal", isHex,
+		withSchema(pattern(`^[0-9a-fA-F]+$`)))
 }
 
 // Lowercase and Uppercase refuse a value that is not already in that case. To
 // fold it instead of refusing it, use ToLower or ToUpper.
+//
+// The pattern each describes is the absence of the other case rather than a
+// list of the letters allowed, since these are Unicode rules and every script
+// with a case distinction has to pass.
 func (p *StringParam) Lowercase() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be lower case", isLower)
+	return p.checked(IssueInvalidFormat, "must be lower case", isLower,
+		withSchema(pattern(`^[^\p{Lu}\p{Lt}]*$`)))
 }
 
 func (p *StringParam) Uppercase() *StringParam {
-	return p.Check(IssueInvalidFormat, "must be upper case", isUpper)
+	return p.checked(IssueInvalidFormat, "must be upper case", isUpper,
+		withSchema(pattern(`^[^\p{Ll}\p{Lt}]*$`)))
 }
 
 // Check adds a rule of your own.
@@ -272,7 +342,17 @@ func (p *StringParam) Uppercase() *StringParam {
 // The predicate takes the field's own type, so there is nothing to assert and
 // nothing to get wrong.
 func (p *StringParam) Check(issue, predicate string, ok func(string) bool) *StringParam {
-	p.add(newRule(issue, predicate, func(v reflect.Value) bool { return ok(v.String()) }))
+	return p.checked(issue, predicate, ok)
+}
+
+// checked is Check with the option to say what the rule means in a schema.
+//
+// The exported Check deliberately has no such option. There is no JSON Schema
+// keyword for "passes this function", and approximating one would put a
+// constraint in the document that the server does not actually enforce — so a
+// custom rule contributes nothing to the schema, and does so on purpose.
+func (p *StringParam) checked(issue, predicate string, ok func(string) bool, opts ...ruleOpt) *StringParam {
+	p.add(newRule(issue, predicate, func(v reflect.Value) bool { return ok(v.String()) }, opts...))
 	return p
 }
 
@@ -315,14 +395,16 @@ func (p *IntParam) Default64(value int64) *IntParam { p.fallback(value); return 
 // Min refuses a value below min.
 func (p *IntParam) Min(min int) *IntParam {
 	p.add(newRule(IssueMinimumNotMet, sprintf("must be at least %d", min),
-		func(v reflect.Value) bool { return v.Int() >= int64(min) }))
+		func(v reflect.Value) bool { return v.Int() >= int64(min) },
+		withSchema(minimum(float64(min)))))
 	return p
 }
 
 // Max refuses a value above max.
 func (p *IntParam) Max(max int) *IntParam {
 	p.add(newRule(IssueMaximumExceeded, sprintf("must be at most %d", max),
-		func(v reflect.Value) bool { return v.Int() <= int64(max) }))
+		func(v reflect.Value) bool { return v.Int() <= int64(max) },
+		withSchema(maximum(float64(max)))))
 	return p
 }
 
@@ -332,43 +414,51 @@ func (p *IntParam) Range(min, max int) *IntParam { return p.Min(min).Max(max) }
 // Positive, NonNegative, Negative, and NonPositive are the bounds around zero,
 // which are common enough to be worth naming.
 func (p *IntParam) Positive() *IntParam {
-	return p.Check(IssueMinimumNotMet, "must be greater than zero",
-		func(value int64) bool { return value > 0 })
+	return p.checked(IssueMinimumNotMet, "must be greater than zero",
+		func(value int64) bool { return value > 0 }, withSchema(exclusiveMinimum(0)))
 }
 
 func (p *IntParam) NonNegative() *IntParam {
-	return p.Check(IssueMinimumNotMet, "must not be negative",
-		func(value int64) bool { return value >= 0 })
+	return p.checked(IssueMinimumNotMet, "must not be negative",
+		func(value int64) bool { return value >= 0 }, withSchema(minimum(0)))
 }
 
 func (p *IntParam) Negative() *IntParam {
-	return p.Check(IssueMaximumExceeded, "must be less than zero",
-		func(value int64) bool { return value < 0 })
+	return p.checked(IssueMaximumExceeded, "must be less than zero",
+		func(value int64) bool { return value < 0 }, withSchema(exclusiveMaximum(0)))
 }
 
 func (p *IntParam) NonPositive() *IntParam {
-	return p.Check(IssueMaximumExceeded, "must not be greater than zero",
-		func(value int64) bool { return value <= 0 })
+	return p.checked(IssueMaximumExceeded, "must not be greater than zero",
+		func(value int64) bool { return value <= 0 }, withSchema(maximum(0)))
 }
 
 // OneOf refuses a value outside the set.
 func (p *IntParam) OneOf(allowed ...int) *IntParam {
 	p.add(newRule(IssueNotInSet, "must be one of "+joinInts(allowed),
-		func(v reflect.Value) bool { return slices.Contains(allowed, int(v.Int())) }))
+		func(v reflect.Value) bool { return slices.Contains(allowed, int(v.Int())) },
+		withSchema(func(s *openapi.Schema) { s.Enum = enumOf(allowed) })))
 	return p
 }
 
 // MultipleOf refuses a value that is not a multiple of step.
 func (p *IntParam) MultipleOf(step int) *IntParam {
 	p.add(newRule(IssueNotMultipleOf, sprintf("must be a multiple of %d", step),
-		func(v reflect.Value) bool { return step != 0 && v.Int()%int64(step) == 0 }))
+		func(v reflect.Value) bool { return step != 0 && v.Int()%int64(step) == 0 },
+		withSchema(func(s *openapi.Schema) { f := float64(step); s.MultipleOf = &f })))
 	return p
 }
 
 // Check adds a rule of your own. The predicate takes an int64, which every
 // integer width fits.
 func (p *IntParam) Check(issue, predicate string, ok func(int64) bool) *IntParam {
-	p.add(newRule(issue, predicate, func(v reflect.Value) bool { return ok(v.Int()) }))
+	return p.checked(issue, predicate, ok)
+}
+
+// checked is Check with a schema keyword; see StringParam.checked for why the
+// exported one has none.
+func (p *IntParam) checked(issue, predicate string, ok func(int64) bool, opts ...ruleOpt) *IntParam {
+	p.add(newRule(issue, predicate, func(v reflect.Value) bool { return ok(v.Int()) }, opts...))
 	return p
 }
 
@@ -396,14 +486,16 @@ func (p *FloatParam) Default(value float64) *FloatParam { p.fallback(value); ret
 // Min refuses a value below min.
 func (p *FloatParam) Min(min float64) *FloatParam {
 	p.add(newRule(IssueMinimumNotMet, sprintf("must be at least %v", min),
-		func(v reflect.Value) bool { return v.Float() >= min }))
+		func(v reflect.Value) bool { return v.Float() >= min },
+		withSchema(minimum(min))))
 	return p
 }
 
 // Max refuses a value above max.
 func (p *FloatParam) Max(max float64) *FloatParam {
 	p.add(newRule(IssueMaximumExceeded, sprintf("must be at most %v", max),
-		func(v reflect.Value) bool { return v.Float() <= max }))
+		func(v reflect.Value) bool { return v.Float() <= max },
+		withSchema(maximum(max))))
 	return p
 }
 
@@ -412,25 +504,49 @@ func (p *FloatParam) Range(min, max float64) *FloatParam { return p.Min(min).Max
 
 // Positive and NonNegative are the bounds around zero.
 func (p *FloatParam) Positive() *FloatParam {
-	return p.Check(IssueMinimumNotMet, "must be greater than zero",
-		func(value float64) bool { return value > 0 })
+	return p.checked(IssueMinimumNotMet, "must be greater than zero",
+		func(value float64) bool { return value > 0 }, withSchema(exclusiveMinimum(0)))
 }
 
 func (p *FloatParam) NonNegative() *FloatParam {
-	return p.Check(IssueMinimumNotMet, "must not be negative",
-		func(value float64) bool { return value >= 0 })
+	return p.checked(IssueMinimumNotMet, "must not be negative",
+		func(value float64) bool { return value >= 0 }, withSchema(minimum(0)))
 }
 
 // Finite refuses the values JSON cannot even carry but a Go float can hold:
-// the infinities and NaN.
+// the infinities and NaN. JSON Schema has no keyword for it — a number is
+// already finite as far as the document is concerned — so it describes
+// nothing.
 func (p *FloatParam) Finite() *FloatParam {
-	return p.Check(IssueInvalidNumber, "must be a finite number",
+	return p.checked(IssueInvalidNumber, "must be a finite number",
 		func(value float64) bool { return !math.IsInf(value, 0) && !math.IsNaN(value) })
+}
+
+// OneOf refuses a value outside the set.
+func (p *FloatParam) OneOf(allowed ...float64) *FloatParam {
+	p.add(newRule(IssueNotInSet, "must be one of "+joinFloats(allowed),
+		func(v reflect.Value) bool { return slices.Contains(allowed, v.Float()) },
+		withSchema(func(s *openapi.Schema) { s.Enum = enumOf(allowed) })))
+	return p
+}
+
+// MultipleOf refuses a value that is not a multiple of step.
+func (p *FloatParam) MultipleOf(step float64) *FloatParam {
+	p.add(newRule(IssueNotMultipleOf, sprintf("must be a multiple of %v", step),
+		func(v reflect.Value) bool { return step != 0 && math.Mod(v.Float(), step) == 0 },
+		withSchema(func(s *openapi.Schema) { s.MultipleOf = &step })))
+	return p
 }
 
 // Check adds a rule of your own.
 func (p *FloatParam) Check(issue, predicate string, ok func(float64) bool) *FloatParam {
-	p.add(newRule(issue, predicate, func(v reflect.Value) bool { return ok(v.Float()) }))
+	return p.checked(issue, predicate, ok)
+}
+
+// checked is Check with a schema keyword; see StringParam.checked for why the
+// exported one has none.
+func (p *FloatParam) checked(issue, predicate string, ok func(float64) bool, opts ...ruleOpt) *FloatParam {
+	p.add(newRule(issue, predicate, func(v reflect.Value) bool { return ok(v.Float()) }, opts...))
 	return p
 }
 
@@ -464,7 +580,8 @@ func (p *BoolParam) MustBe(expected bool) *BoolParam {
 	if !expected {
 		predicate = "must be false"
 	}
-	p.add(newRule(IssueNotInSet, predicate, func(v reflect.Value) bool { return v.Bool() == expected }))
+	p.add(newRule(IssueNotInSet, predicate, func(v reflect.Value) bool { return v.Bool() == expected },
+		withSchema(func(s *openapi.Schema) { s.Const, s.HasConst = expected, true })))
 	return p
 }
 
@@ -510,6 +627,10 @@ func (p *TimeParam) Before(boundary time.Time) *TimeParam {
 
 // Past and Future are After and Before against the moment the request is
 // judged, which is what a date of birth or an expiry needs.
+//
+// Neither describes anything in the schema. A document is written once, at
+// startup, and "before now" means something different every second — a bound
+// written into it would be wrong by the time anyone read it.
 func (p *TimeParam) Past() *TimeParam {
 	return p.Check(IssueTooLate, "must be in the past",
 		func(value time.Time) bool { return value.Before(time.Now()) })
@@ -543,6 +664,10 @@ func (p *DurationParam) Required() *DurationParam { p.require(); return p }
 func (p *DurationParam) Default(value time.Duration) *DurationParam { p.fallback(value); return p }
 
 // Min refuses a duration shorter than min.
+//
+// Neither bound describes anything in the schema: a duration crosses the wire
+// as the string Go writes it, "1h30m", so a numeric minimum would be a bound
+// on a value the document says is a string.
 func (p *DurationParam) Min(min time.Duration) *DurationParam {
 	return p.Check(IssueMinimumNotMet, "must be at least "+min.String(),
 		func(value time.Duration) bool { return value >= min })
@@ -605,8 +730,10 @@ func (p *StringsParam) Unique() *StringsParam {
 }
 
 // OneOf refuses a list containing anything outside the set.
+//
+// The set describes the entries, not the list, so the enum lands on the items.
 func (p *StringsParam) OneOf(allowed ...string) *StringsParam {
-	p.add(newRule(IssueNotInSet, "must contain only "+strings.Join(allowed, ", "),
+	r := newRule(IssueNotInSet, "must contain only "+strings.Join(allowed, ", "),
 		func(v reflect.Value) bool {
 			for i := range v.Len() {
 				if !slices.Contains(allowed, v.Index(i).String()) {
@@ -614,7 +741,10 @@ func (p *StringsParam) OneOf(allowed ...string) *StringsParam {
 				}
 			}
 			return true
-		}))
+		},
+		withSchema(func(s *openapi.Schema) { s.Enum = enumOf(allowed) }))
+	r.items = true
+	p.add(r)
 	return p
 }
 
@@ -700,12 +830,14 @@ func (p *IntsParam) Check(issue, predicate string, ok func([]int) bool) *IntsPar
 // care what the list holds.
 func minItemsRule(n int) rule {
 	return newRule(IssueTooFewItems, plural("must have at least %d value", n),
-		func(v reflect.Value) bool { return v.Len() >= n })
+		func(v reflect.Value) bool { return v.Len() >= n },
+		withSchema(func(s *openapi.Schema) { s.MinItems = &n }))
 }
 
 func maxItemsRule(n int) rule {
 	return newRule(IssueTooManyItems, plural("must have at most %d value", n),
-		func(v reflect.Value) bool { return v.Len() <= n })
+		func(v reflect.Value) bool { return v.Len() <= n },
+		withSchema(func(s *openapi.Schema) { s.MaxItems = &n }))
 }
 
 func uniqueRule() rule {
@@ -719,7 +851,7 @@ func uniqueRule() rule {
 			seen[entry] = true
 		}
 		return true
-	})
+	}, withSchema(func(s *openapi.Schema) { s.UniqueItems = true }))
 }
 
 // eachRules lifts the rules declared for one entry into rules about the list.
@@ -727,10 +859,15 @@ func uniqueRule() rule {
 // A failure is reported against the list, because that is the field the client
 // named; the message says every value rather than the value, so it reads as
 // what it is.
+//
+// The keyword goes the other way. A lifted rule is marked as belonging to the
+// items, because MinLen declared for every entry is a minLength on the entry's
+// schema — writing it onto the array would say the list is short, not that a
+// value in it is.
 func eachRules(entry *fieldSpec) []rule {
 	lifted := make([]rule, 0, len(entry.rules))
 	for _, r := range entry.rules {
-		lifted = append(lifted, newPhrasedRule(
+		item := newPhrasedRule(
 			r.issue,
 			func(name string) string { return "every value in " + r.message(name) },
 			func(v reflect.Value) bool {
@@ -741,7 +878,9 @@ func eachRules(entry *fieldSpec) []rule {
 				}
 				return true
 			},
-		))
+		)
+		item.schema, item.items = r.schema, true
+		lifted = append(lifted, item)
 	}
 	return lifted
 }

@@ -126,6 +126,18 @@ type routeCompiler struct {
 	scoped map[reflect.Type]int // request-scoped type → its slot on the exchange
 	slots  int                  // number of request-scoped slots assigned so far
 
+	// params and body are what the route binds, recorded for the OpenAPI
+	// document as each field is compiled.
+	//
+	// They are collected here rather than derived again later because this is
+	// where a field's wire name is settled, and a second derivation could
+	// drift from this one. Collecting them on the route rather than on the
+	// unit is also what lets the document describe a header a dependency
+	// reads: a dependency is compiled through this same state, so its inputs
+	// land here beside the handler's.
+	params []docParam
+	body   *docBody
+
 	// bodyFrom and formFrom name whatever already consumed the request body,
 	// across every unit of the route, because the body is read once however
 	// the dependencies and the handler divide up what reads it.

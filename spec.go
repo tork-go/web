@@ -154,6 +154,7 @@ func (c *handlerCompiler) compileSpec(spec *inputSpec) (*inputPlan, error) {
 			typ:    spec.body.typ,
 			checks: compileBodyChecks(spec.body.typ),
 		}
+		c.rc.body = &docBody{typ: spec.body.typ}
 	}
 
 	return plan, nil
@@ -189,6 +190,10 @@ func (c *handlerCompiler) compileField(plan *inputPlan, spec *fieldSpec) error {
 		plan.files = append(plan.files, fileBinder{
 			index: spec.index, name: name, errField: errField, multiple: spec.fileMulti,
 		})
+		c.describe(docParam{
+			source: spec.source, name: name, required: spec.required,
+			typ: fieldTypeAt(plan.typ, spec.index), file: true, fileMulti: spec.fileMulti,
+		})
 		return nil
 	}
 
@@ -208,7 +213,27 @@ func (c *handlerCompiler) compileField(plan *inputPlan, spec *fieldSpec) error {
 	}
 
 	plan.fields = append(plan.fields, binder)
+	c.describe(docParam{
+		source: spec.source, name: name, required: spec.required, typ: fieldType,
+		rules: spec.rules, fallback: binder.fallback, csv: spec.csv,
+	})
 	return nil
+}
+
+// describe records a bound field for the document, unless the route already
+// has one under the same name.
+//
+// A dependency and the handler are compiled separately and may each read the
+// same parameter — both wanting the page number is not a mistake — so the
+// document keeps the first and the duplicate is dropped rather than described
+// twice.
+func (c *handlerCompiler) describe(p docParam) {
+	for _, existing := range c.rc.params {
+		if existing.source == p.source && existing.name == p.name {
+			return
+		}
+	}
+	c.rc.params = append(c.rc.params, p)
 }
 
 // fieldTypeAt walks an index path to the type it names.
@@ -344,6 +369,16 @@ func joinInts(values []int) string {
 	parts := make([]string, len(values))
 	for i, value := range values {
 		parts[i] = strconv.Itoa(value)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// joinFloats is joinInts for a set of numbers, written the way Go writes one
+// so that 1.5 reads as 1.5 rather than as 1.500000.
+func joinFloats(values []float64) string {
+	parts := make([]string, len(values))
+	for i, value := range values {
+		parts[i] = strconv.FormatFloat(value, 'g', -1, 64)
 	}
 	return strings.Join(parts, ", ")
 }

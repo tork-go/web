@@ -36,6 +36,12 @@ type handlerPlan struct {
 	// a slot already written.
 	deps  []depStep
 	slots int
+
+	// bound and body are what the route reads from a request, recorded as it
+	// was compiled so the OpenAPI document can describe it without deriving
+	// any of it a second time. Nothing reads them while a request is served.
+	bound []docParam
+	body  *docBody
 }
 
 // paramBinder produces one argument for a handler call. Everything a
@@ -92,6 +98,7 @@ func compileHandler(route *Route, inj *injector) (*handlerPlan, error) {
 	}
 	plan.result = result
 	plan.slots = rc.slots
+	plan.bound, plan.body = rc.params, rc.body
 	route.ResponseSpec = spec
 
 	return plan, nil

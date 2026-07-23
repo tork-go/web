@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/tork-go/web/openapi"
 )
 
 // App is the application: the root of the router tree and the metadata
@@ -25,9 +27,10 @@ type App struct {
 	opts []Option
 	root *Router
 
-	// info is what the build learned about the API itself, kept for the
-	// OpenAPI document.
+	// info and docs are what the build learned about the API itself, kept for
+	// the OpenAPI document.
 	info apiInfo
+	docs OpenAPIConfig
 
 	// A built application constructs its singletons exactly once, however many
 	// times Handler is asked for it, and remembers the result so Close can
@@ -44,6 +47,7 @@ type App struct {
 type apiInfo struct {
 	title       string
 	description string
+	schemes     []openapi.SecurityScheme
 }
 
 // New begins an application.
@@ -155,7 +159,8 @@ func (a *App) Close(ctx context.Context) error {
 func (a *App) build(construct bool) ([]*Route, http.Handler, *server, error) {
 	base := meta{now: time.Now, providers: &providerSet{}}
 	errs := applyOptions(&base, scopeApp|scopeRouter, "an application", a.opts)
-	a.info = apiInfo{title: base.title, description: base.description}
+	a.info = apiInfo{title: base.title, description: base.description, schemes: base.schemes}
+	a.docs = base.docs
 
 	routes, resolveErrs := a.root.resolve(base)
 	errs = append(errs, resolveErrs...)

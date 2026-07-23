@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/tork-go/web/openapi"
 )
 
 // meta is everything a declaration site can say, in one struct.
@@ -26,6 +28,7 @@ type meta struct {
 	version      string
 	responses    map[int]ResponseDoc
 	throws       map[reflect.Type]ResponseDoc
+	security     []openapi.SecurityRequirement
 
 	// providers is the application-wide provider set. Unlike everything else
 	// in this group it is a pointer to one shared collection rather than a
@@ -52,6 +55,8 @@ type meta struct {
 	errorWriter  ErrorWriter
 	maxBodyBytes int64
 	strictBodies bool
+	docs         OpenAPIConfig
+	schemes      []openapi.SecurityScheme
 }
 
 // inherited returns what a child declaration starts from: the inheritable
@@ -71,6 +76,7 @@ func (m meta) inherited() meta {
 		version:      m.version,
 		responses:    maps.Clone(m.responses),
 		throws:       maps.Clone(m.throws),
+		security:     slices.Clone(m.security),
 		providers:    m.providers,
 	}
 }
@@ -119,6 +125,12 @@ type Route struct {
 	// is unexported because it is machinery, not description — what it
 	// produces reaches a handler as a parameter.
 	dependencies []dependencyDecl
+
+	// security is what a request to this route must satisfy, inherited from
+	// whatever declared it with Secured. It changes nothing at runtime — a
+	// guard dependency does the refusing — and exists so the document can say
+	// which operations are authenticated.
+	security []openapi.SecurityRequirement
 
 	// handler is the function as the user wrote it, kept for the generator
 	// and for error messages; plan is what actually runs.
@@ -183,6 +195,7 @@ func (d *declaredRoute) resolve(parent meta) ([]*Route, []error) {
 		Responses:    m.responses,
 		Throws:       m.throws,
 		dependencies: m.dependencies,
+		security:     m.security,
 		handler:      d.handler,
 		middleware:   m.middleware,
 		site:         d.site,
