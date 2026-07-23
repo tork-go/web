@@ -15,9 +15,10 @@ import (
 // At request time nothing consults it: a handler's injected parameter was
 // already resolved to a slice index, so serving pays for none of this.
 type injector struct {
-	byType         map[reflect.Type]*provider // the provider for each type, deduplicated
-	singletonIndex map[reflect.Type]int       // type → index in the server's singleton slice
-	order          []*provider                // build order: dependencies first
+	byType          map[reflect.Type]*provider // the provider for each type, deduplicated
+	singletonIndex  map[reflect.Type]int       // singleton type → index in the server's singleton slice
+	transientByType map[reflect.Type]*provider // transient type → its provider, built on demand
+	order           []*provider                // singleton build order: dependencies first
 }
 
 // analyzeGraph turns a flat provider set into a checked, ordered graph, or
@@ -26,20 +27,26 @@ type injector struct {
 // the same bargain the rest of the build makes.
 func analyzeGraph(ps *providerSet) (*injector, []error) {
 	inj := &injector{
-		byType:         map[reflect.Type]*provider{},
-		singletonIndex: map[reflect.Type]int{},
+		byType:          map[reflect.Type]*provider{},
+		singletonIndex:  map[reflect.Type]int{},
+		transientByType: map[reflect.Type]*provider{},
 	}
 	var errs []error
 
 	// Shape and duplicate: a malformed provider names why it is malformed, a
 	// second provider for a type names the first. The first declared wins the
 	// type, so a later stage never mistakes the loser's absence for "nothing
-	// provides this".
+	// provides this". A transient that registers a cleanup is reported here
+	// but still recorded, so a handler that uses it is not also told nothing
+	// provides it.
 	for i := range ps.all {
 		p := &ps.all[i]
 		if p.badShape != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", p.site, p.badShape))
 			continue
+		}
+		if p.transient && p.kind == providerCtorClean {
+			errs = append(errs, fmt.Errorf("%s: a transient provider cannot register a tork.Cleanup; its lifetime is the injection, not the application", p.site))
 		}
 		if first, dup := inj.byType[p.out]; dup {
 			errs = append(errs, fmt.Errorf("%s: a provider for %s is already declared at %s", p.site, p.out, first.site))
@@ -173,6 +180,12 @@ func (inj *injector) topoSort(ps *providerSet) {
 				visit(dep)
 			}
 		}
+		// A transient is not built at boot and holds no fixed value, so it is
+		// recorded to be built on demand rather than given a singleton slot.
+		if p.transient {
+			inj.transientByType[p.out] = p
+			return
+		}
 		p.index = len(inj.order)
 		inj.singletonIndex[p.out] = p.index
 		inj.order = append(inj.order, p)
@@ -183,6 +196,35 @@ func (inj *injector) topoSort(ps *providerSet) {
 			continue
 		}
 		visit(p)
+	}
+}
+
+// transientBuilder precompiles how to build one transient value: each of its
+// arguments resolved once, at build, to a read of a singleton or to a nested
+// transient's builder, so constructing one at request time costs no graph
+// lookup. The graph is acyclic by the time this runs, so the recursion through
+// transient dependencies terminates.
+func (inj *injector) transientBuilder(t reflect.Type) func(*server) (reflect.Value, error) {
+	p := inj.transientByType[t]
+	resolvers := make([]func(*server) (reflect.Value, error), len(p.deps))
+	for i, d := range p.deps {
+		if idx, ok := inj.singletonIndex[d]; ok {
+			resolvers[i] = func(s *server) (reflect.Value, error) { return s.singletons[idx], nil }
+		} else {
+			resolvers[i] = inj.transientBuilder(d)
+		}
+	}
+	return func(s *server) (reflect.Value, error) {
+		args := make([]reflect.Value, len(resolvers))
+		for i, resolve := range resolvers {
+			v, err := resolve(s)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			args[i] = v
+		}
+		value, _, err := splitProviderReturn(p, p.fn.Call(args))
+		return value, err
 	}
 }
 

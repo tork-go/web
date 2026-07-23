@@ -133,6 +133,12 @@ func (c *handlerCompiler) param(t reflect.Type) (paramBinder, error) {
 			return ex.slots[slot], nil
 		}, nil
 	}
+	if _, ok := c.rc.inj.transientByType[t]; ok {
+		build := c.rc.inj.transientBuilder(t)
+		return func(ex *exchange) (reflect.Value, error) {
+			return build(ex.srv)
+		}, nil
+	}
 
 	return nil, fmt.Errorf("nothing provides %s; take it from a tork.Provide or a tork.Depends", t)
 }

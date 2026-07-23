@@ -42,12 +42,13 @@ const (
 // build surfaces every mistake rather than stopping at the first constructor
 // that was not a function.
 type provider struct {
-	out   reflect.Type   // the type produced
-	fn    reflect.Value  // the constructor, or the zero Value for a value provider
-	value reflect.Value  // ProvideValue's prebuilt value
-	deps  []reflect.Type // the constructor's parameter types, in order
-	kind  providerKind
-	site  string // the Provide/ProvideValue call line
+	out       reflect.Type   // the type produced
+	fn        reflect.Value  // the constructor, or the zero Value for a value provider
+	value     reflect.Value  // ProvideValue's prebuilt value
+	deps      []reflect.Type // the constructor's parameter types, in order
+	kind      providerKind
+	transient bool   // built fresh at each injection rather than once and shared
+	site      string // the Provide/ProvideValue call line
 
 	// index is where this provider's built value lives in the server's
 	// singleton slice, assigned in topological order so a provider's
@@ -95,10 +96,36 @@ func Provide(constructors ...any) Option {
 	site := callerSite(2)
 	return newOption("Provide", scopeApp|scopeRouter, func(m *meta) error {
 		for _, c := range constructors {
+			if marker, ok := c.(transientMarker); ok {
+				p := reflectProvider(marker.constructor, site)
+				p.transient = true
+				m.providers.add(p)
+				continue
+			}
 			m.providers.add(reflectProvider(c, site))
 		}
 		return nil
 	})
+}
+
+// transientMarker is what Transient wraps a constructor in so Provide can tell
+// a transient one from a singleton without a second registration function.
+type transientMarker struct{ constructor any }
+
+// Transient marks a constructor, inside Provide, as one that builds a fresh
+// value at each place it is injected instead of a single shared one.
+//
+//	tork.Provide(NewRepository, tork.Transient(NewRequestScratch))
+//
+// It is the rare case: most services are shared for the life of the
+// application or for the life of a request, and only a value that must not be
+// aliased — a builder two callers would corrupt, a buffer each use needs its
+// own of — wants a new instance every time. A transient is built from the
+// singletons in the graph, not from anything request-scoped, and cannot
+// register a tork.Cleanup: its lifetime is the injection, not the application,
+// so there is no shutdown for one to run at.
+func Transient(constructor any) any {
+	return transientMarker{constructor: constructor}
 }
 
 // ProvideValue registers a value that is already built — an opened database
