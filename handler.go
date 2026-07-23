@@ -41,7 +41,7 @@ type paramBinder func(*exchange) (reflect.Value, error)
 // decided entirely here: every parameter has to be something it knows how to
 // produce, and the results have to end in an error. Anything else is a
 // mistake in the caller's source, reported with the type that caused it.
-func compileHandler(route *Route) (*handlerPlan, error) {
+func compileHandler(route *Route, inj *injector) (*handlerPlan, error) {
 	if route.handler == nil {
 		return nil, fmt.Errorf("handler is nil")
 	}
@@ -55,7 +55,7 @@ func compileHandler(route *Route) (*handlerPlan, error) {
 		return nil, fmt.Errorf("handler is variadic, which leaves the framework nothing to pass")
 	}
 
-	compiler := newHandlerCompiler(route)
+	compiler := newHandlerCompiler(route, inj)
 	plan := &handlerPlan{fn: fn}
 	for i := range fnType.NumIn() {
 		binder, err := compiler.param(fnType.In(i))
@@ -101,7 +101,13 @@ func (c *handlerCompiler) param(t reflect.Type) (paramBinder, error) {
 		return plan.bind, nil
 	}
 
-	return nil, fmt.Errorf("cannot supply a value of type %s", t)
+	if idx, ok := c.inj.singletonIndex[t]; ok {
+		return func(ex *exchange) (reflect.Value, error) {
+			return ex.srv.singletons[idx], nil
+		}, nil
+	}
+
+	return nil, fmt.Errorf("nothing provides %s; take it from a tork.Provide or a tork.Depends", t)
 }
 
 // bindContext hands the handler the request's context.

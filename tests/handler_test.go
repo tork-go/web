@@ -33,7 +33,7 @@ func TestHandlerSignaturesRefused(t *testing.T) {
 		{
 			name:    "unsupported parameter",
 			handler: func(context.Context, int) (greeting, error) { return greeting{}, nil },
-			want:    "parameter 1: cannot supply a value of type int",
+			want:    "parameter 1: nothing provides int",
 		},
 		{
 			name:    "no results",

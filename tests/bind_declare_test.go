@@ -233,12 +233,12 @@ func TestMarkedBodyAndTaggedBodyCollide(t *testing.T) {
 }
 
 // A struct with no binding tags and no marker is not an input at all; it is a
-// dependency, which nothing can supply yet.
+// dependency, which nothing here provides.
 func TestUntaggedStructIsNotAnInput(t *testing.T) {
 	app := newApp()
 	app.GET("/", func(context.Context, *Service) (string, error) { return "", nil })
 
-	if msg := buildError(t, app); !strings.Contains(msg, "cannot supply a value of type *tork_test.Service") {
+	if msg := buildError(t, app); !strings.Contains(msg, "nothing provides *tork_test.Service") {
 		t.Errorf("error = %q", msg)
 	}
 }

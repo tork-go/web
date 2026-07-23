@@ -273,7 +273,7 @@ func TestUntaggedStructValueIsNotAnInput(t *testing.T) {
 	app := newApp()
 	app.GET("/", func(context.Context, Service) (string, error) { return "", nil })
 
-	if msg := buildError(t, app); !strings.Contains(msg, "cannot supply a value of type tork_test.Service") {
+	if msg := buildError(t, app); !strings.Contains(msg, "nothing provides tork_test.Service") {
 		t.Errorf("error = %q", msg)
 	}
 }

@@ -1,12 +1,14 @@
 package tork
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -61,6 +63,20 @@ type server struct {
 	errorWriter  ErrorWriter
 	maxBodyBytes int64
 	strictBodies bool
+
+	// singletons holds every provided value, built once when the application
+	// built and read by index, so a handler needing one pays a slice access
+	// and no lookup. singletonCleanups are what those providers registered, in
+	// construction order, run in reverse when the application shuts down.
+	singletons        []reflect.Value
+	singletonCleanups []Cleanup
+}
+
+// close runs the singleton cleanups in reverse of construction, which is the
+// order that tears a graph down safely: a thing built on top of another is
+// released first.
+func (s *server) close(ctx context.Context) error {
+	return errors.Join(runCleanups(ctx, s.singletonCleanups)...)
 }
 
 // newServer registers every route and returns the handler that serves them.
@@ -70,7 +86,7 @@ type server struct {
 // two patterns that overlap without one being more specific, and it says so
 // by panicking, so the panic is turned back into the error the build was
 // collecting.
-func newServer(routes []*Route, base meta) (http.Handler, error) {
+func newServer(routes []*Route, base meta, inj *injector, construct bool) (*server, error) {
 	s := &server{
 		mux:          http.NewServeMux(),
 		now:          base.now,
@@ -88,6 +104,21 @@ func newServer(routes []*Route, base meta) (http.Handler, error) {
 	}
 	if s.maxBodyBytes == 0 {
 		s.maxBodyBytes = defaultMaxBodyBytes
+	}
+
+	// Singletons are built here, not while resolving the tree, because
+	// construction is the one part of a build that runs the application's own
+	// code and can fail for reasons no declaration reveals. Routes() asks for
+	// the route table without it, so listing routes never opens a database;
+	// Handler() asks with it, so serving fails at boot if a singleton cannot
+	// be built rather than on the first request that needs one.
+	if construct {
+		singletons, cleanups, err := constructSingletons(context.Background(), inj)
+		if err != nil {
+			return nil, err
+		}
+		s.singletons = singletons
+		s.singletonCleanups = cleanups
 	}
 
 	// Paths are collected in declaration order rather than read back out of
@@ -126,8 +157,13 @@ func newServer(routes []*Route, base meta) (http.Handler, error) {
 	// unlike the others it needs no guard.
 	s.mux.Handle("/", http.HandlerFunc(s.notFound))
 
-	return s.mux, nil
+	return s, nil
 }
+
+// handler is the http.Handler a built server serves as. It is separate from
+// the server so that shutdown, which the server owns, is not reachable through
+// the value handed to net/http.
+func (s *server) handler() http.Handler { return s.mux }
 
 // servePath is a route's path as ServeMux needs it spelled.
 //

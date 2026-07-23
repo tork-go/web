@@ -121,15 +121,17 @@ type bodyCheck struct {
 // once no matter how the input structs are divided up.
 type handlerCompiler struct {
 	route     *Route
+	inj       *injector
 	wildcards map[string]bool
 	claimed   map[string]string
 	bodyFrom  string
 	formFrom  string
 }
 
-func newHandlerCompiler(route *Route) *handlerCompiler {
+func newHandlerCompiler(route *Route, inj *injector) *handlerCompiler {
 	return &handlerCompiler{
 		route:     route,
+		inj:       inj,
 		wildcards: wildcardsOf(route.Path),
 		claimed:   map[string]string{},
 	}

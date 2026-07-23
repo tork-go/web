@@ -19,7 +19,7 @@ func TestDefineInputRefusesANonStruct(t *testing.T) {
 
 	// An int parameter is not an input at all, so the build fails on that
 	// first; the declaration's own complaint is what this proves is recorded.
-	if msg := buildError(t, app); !strings.Contains(msg, "cannot supply a value of type int") {
+	if msg := buildError(t, app); !strings.Contains(msg, "nothing provides int") {
 		t.Errorf("error = %q", msg)
 	}
 }
@@ -30,7 +30,7 @@ func TestDefineBodyRefusesANonStruct(t *testing.T) {
 	app := newApp()
 	app.POST("/notstructbody", func(context.Context, string) (string, error) { return "", nil })
 
-	if msg := buildError(t, app); !strings.Contains(msg, "cannot supply a value of type string") {
+	if msg := buildError(t, app); !strings.Contains(msg, "nothing provides string") {
 		t.Errorf("error = %q", msg)
 	}
 }

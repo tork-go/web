@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -27,6 +28,16 @@ type App struct {
 	// info is what the build learned about the API itself, kept for the
 	// OpenAPI document.
 	info apiInfo
+
+	// A built application constructs its singletons exactly once, however many
+	// times Handler is asked for it, and remembers the result so Close can
+	// reach the cleanups those singletons registered. buildOnce guards the
+	// construction; built is the server it produced, or nil if the build
+	// failed or has not happened.
+	buildOnce    sync.Once
+	builtHandler http.Handler
+	built        *server
+	buildErr     error
 }
 
 // apiInfo is the application-level metadata an OpenAPI document needs.
@@ -102,7 +113,7 @@ func (a *App) OPTIONS(path string, handler any, opts ...Option) {
 // order. It is what the OpenAPI builder and the generator read, and what a
 // test asserts against when it wants the route table rather than a server.
 func (a *App) Routes() ([]*Route, error) {
-	routes, _, err := a.build()
+	routes, _, _, err := a.build(false)
 	return routes, err
 }
 
@@ -113,26 +124,47 @@ func (a *App) Routes() ([]*Route, error) {
 // against what the framework knows how to call, and the whole route table
 // against itself for duplicates. All of it is reported together.
 //
-// Tests want this rather than Run: it needs no port, and it returns the same
-// handler net/http would be given.
+// The build happens once, however many times Handler is called: the
+// singletons an application constructs are constructed a single time, and Close
+// tears down the same ones. Tests want this rather than Run: it needs no port,
+// and it returns the same handler net/http would be given.
 func (a *App) Handler() (http.Handler, error) {
-	_, h, err := a.build()
-	return h, err
+	a.buildOnce.Do(func() {
+		_, a.builtHandler, a.built, a.buildErr = a.build(true)
+	})
+	return a.builtHandler, a.buildErr
 }
 
-// build resolves the tree once and returns both of the things callers want
-// from it, so asking for the routes and asking for the handler cannot
-// disagree about what the application contains.
-func (a *App) build() ([]*Route, http.Handler, error) {
-	base := meta{now: time.Now}
+// Close runs the cleanups the application's singletons registered, in reverse
+// of the order they were built. It is called for you when Serve or
+// ServeListener returns, and is exported for an application built with Handler
+// and served some other way. An application that never built, or failed to,
+// has nothing to close.
+func (a *App) Close(ctx context.Context) error {
+	if a.built == nil {
+		return nil
+	}
+	return a.built.close(ctx)
+}
+
+// build resolves the tree once and returns the things callers want from it, so
+// asking for the routes and asking for the handler cannot disagree about what
+// the application contains. It constructs the application's singletons only
+// when construct is set, which is what lets Routes report a graph's mistakes
+// without running its constructors.
+func (a *App) build(construct bool) ([]*Route, http.Handler, *server, error) {
+	base := meta{now: time.Now, providers: &providerSet{}}
 	errs := applyOptions(&base, scopeApp|scopeRouter, "an application", a.opts)
 	a.info = apiInfo{title: base.title, description: base.description}
 
 	routes, resolveErrs := a.root.resolve(base)
 	errs = append(errs, resolveErrs...)
 
+	inj, graphErrs := analyzeGraph(base.providers)
+	errs = append(errs, graphErrs...)
+
 	for _, route := range routes {
-		plan, err := compileHandler(route)
+		plan, err := compileHandler(route, inj)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %s: %w", route.site, route, err))
 			continue
@@ -143,14 +175,14 @@ func (a *App) build() ([]*Route, http.Handler, error) {
 	errs = append(errs, checkUnique(routes)...)
 
 	if len(errs) > 0 {
-		return nil, nil, errors.Join(errs...)
+		return nil, nil, nil, errors.Join(errs...)
 	}
 
-	h, err := newServer(routes, base)
+	s, err := newServer(routes, base, inj, construct)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return routes, h, nil
+	return routes, s.handler(), s, nil
 }
 
 // checkUnique reports the two collisions a route table can contain: the same
@@ -236,11 +268,14 @@ func (a *App) ServeListener(ctx context.Context, listener net.Listener) error {
 	case err := <-serveErr:
 		// Serve only returns on its own when the listener failed; the
 		// shutdown below never reaches this case, because it returns
-		// without waiting for the goroutine.
-		return err
+		// without waiting for the goroutine. The singletons are closed even
+		// so, since they were built and the process is done with them.
+		grace, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		return errors.Join(err, a.Close(grace))
 	case <-ctx.Done():
 		grace, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
-		return srv.Shutdown(grace)
+		return errors.Join(srv.Shutdown(grace), a.Close(grace))
 	}
 }

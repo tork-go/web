@@ -26,6 +26,14 @@ type meta struct {
 	responses  map[int]ResponseDoc
 	throws     map[reflect.Type]ResponseDoc
 
+	// providers is the application-wide provider set. Unlike everything else
+	// in this group it is a pointer to one shared collection rather than a
+	// value cloned per level, because a provider declared on any router is
+	// visible everywhere: inherited() copies the pointer, so a Provide deep in
+	// the tree still lands in the one set build() reads. It is seeded in
+	// build() so an option's apply can always assume it is non-nil.
+	providers *providerSet
+
 	// Belonging to one operation, and never inherited. A summary that
 	// applied to every route under a router would be wrong on all but the
 	// one it was written for.
@@ -61,6 +69,7 @@ func (m meta) inherited() meta {
 		version:    m.version,
 		responses:  maps.Clone(m.responses),
 		throws:     maps.Clone(m.throws),
+		providers:  m.providers,
 	}
 }
 
