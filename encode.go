@@ -2,6 +2,7 @@ package tork
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 )
 
@@ -22,8 +23,23 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 	if err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", contentTypeJSON)
+	return writeBody(w, status, contentTypeJSON, nil, body)
+}
+
+// writeBody writes a status, a content type, any extra headers, and a body
+// already reduced to bytes.
+//
+// It exists so that every response type with a body it can hold in memory —
+// writeJSON's plain T, Response's JSON body, RawResponse's bytes — writes
+// the same way instead of each repeating the header-then-status-then-body
+// order by hand.
+func writeBody(w http.ResponseWriter, status int, contentType string, headers http.Header, body []byte) error {
+	h := w.Header()
+	maps.Copy(h, headers)
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	}
 	w.WriteHeader(status)
-	_, err = w.Write(body)
+	_, err := w.Write(body)
 	return err
 }

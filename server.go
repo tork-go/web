@@ -183,10 +183,58 @@ func (s *server) serve(route *Route) http.Handler {
 			return
 		}
 
+		if resp, ok := result.(Responder); ok {
+			// tracked reports whether anything actually reached the client,
+			// which is what decides how a failing Responder is answered: one
+			// that fails before writing — the common case, since marshalling
+			// comes first — is still a clean failure and gets the same
+			// envelope writeJSON's own failures do; one that fails partway
+			// through a body already begun can only be logged, because the
+			// status line is already on the wire.
+			tracker := trackResponse(w)
+			if err := resp.WriteResponse(tracker, r); err != nil {
+				if tracker.started {
+					s.logger.Error("cannot write response", "method", r.Method, "path", r.URL.Path, "error", err)
+				} else {
+					s.fail(w, r, err)
+				}
+			}
+			return
+		}
+
 		if err := writeJSON(w, http.StatusOK, result); err != nil {
 			s.fail(w, r, err)
 		}
 	})
+}
+
+// responseTracker wraps a ResponseWriter to record whether a response has
+// begun, which is the one thing serve needs to know about a Responder that
+// failed and cannot know any other way: net/http's ResponseWriter has no
+// method that answers "has anything been sent yet".
+//
+// A Responder that also needs to flush — Stream does — gets a tracker that
+// preserves http.Flusher too; nothing before it does, so there is nothing
+// here yet for that tracker to wrap.
+type responseTracker struct {
+	http.ResponseWriter
+	started bool
+}
+
+func (t *responseTracker) WriteHeader(status int) {
+	t.started = true
+	t.ResponseWriter.WriteHeader(status)
+}
+
+func (t *responseTracker) Write(b []byte) (int, error) {
+	t.started = true
+	return t.ResponseWriter.Write(b)
+}
+
+// trackResponse wraps w so the caller can learn, after the fact, whether
+// anything reached the client.
+func trackResponse(w http.ResponseWriter) *responseTracker {
+	return &responseTracker{ResponseWriter: w}
 }
 
 // recoverPanic turns a panicking handler into an internal error.

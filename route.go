@@ -81,6 +81,13 @@ type Route struct {
 	// any version.
 	Version string
 
+	// ResponseSpec is what the handler's result type promises about its
+	// response, when that type implements Responder; nil for a plain T,
+	// which is still 200 JSON, or for an error-only handler. It is set once
+	// at build and read by nothing at request time — it exists for the
+	// OpenAPI phase to build a document from without a request.
+	ResponseSpec *ResponseSpec
+
 	// handler is the function as the user wrote it, kept for the generator
 	// and for error messages; plan is what actually runs.
 	handler any

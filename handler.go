@@ -65,11 +65,12 @@ func compileHandler(route *Route) (*handlerPlan, error) {
 		plan.params = append(plan.params, binder)
 	}
 
-	result, err := compileResults(fnType)
+	result, spec, err := compileResults(fnType)
 	if err != nil {
 		return nil, err
 	}
 	plan.result = result
+	route.ResponseSpec = spec
 
 	return plan, nil
 }
@@ -113,30 +114,55 @@ func bindRequest(ex *exchange) (reflect.Value, error) {
 	return reflect.ValueOf(&Request{request: ex.request, writer: ex.writer}), nil
 }
 
-// compileResults checks the return signature and reports the success type.
+// compileResults checks the return signature and reports the success type
+// and, when that type answers for itself, the ResponseSpec it answers with.
 //
 // Handlers return (T, error) or error alone. The error is last because that
 // is where Go puts it, and it is required because a handler that cannot fail
 // is rare enough that letting it say so would cost every other handler a
 // second shape to remember.
-func compileResults(fnType reflect.Type) (reflect.Type, error) {
+func compileResults(fnType reflect.Type) (reflect.Type, *ResponseSpec, error) {
 	switch fnType.NumOut() {
 	case 1:
 		if fnType.Out(0) != errorType {
-			return nil, fmt.Errorf("returns %s alone; a handler returns (T, error) or error", fnType.Out(0))
+			return nil, nil, fmt.Errorf("returns %s alone; a handler returns (T, error) or error", fnType.Out(0))
 		}
-		return nil, nil
+		return nil, nil, nil
 	case 2:
 		if fnType.Out(1) != errorType {
-			return nil, fmt.Errorf("returns (%s, %s); the second result must be error", fnType.Out(0), fnType.Out(1))
+			return nil, nil, fmt.Errorf("returns (%s, %s); the second result must be error", fnType.Out(0), fnType.Out(1))
 		}
 		if fnType.Out(0) == errorType {
-			return nil, fmt.Errorf("returns (error, error); a handler returns (T, error) or error")
+			return nil, nil, fmt.Errorf("returns (error, error); a handler returns (T, error) or error")
 		}
-		return fnType.Out(0), nil
+		t := fnType.Out(0)
+		spec, err := responderSpec(t)
+		if err != nil {
+			return nil, nil, err
+		}
+		return t, spec, nil
 	default:
-		return nil, fmt.Errorf("returns %d values; a handler returns (T, error) or error", fnType.NumOut())
+		return nil, nil, fmt.Errorf("returns %d values; a handler returns (T, error) or error", fnType.NumOut())
 	}
+}
+
+// responderSpec reports what t promises about its response when it
+// implements Responder, and nil when t is a plain success type that still
+// serializes as JSON with status 200.
+//
+// The case where *t implements Responder but t does not is worth naming on
+// its own: without it, a handler that returns items.Created by value when
+// only *items.Created satisfies Responder would fail with nothing more than
+// "cannot supply", which does not say what is wrong.
+func responderSpec(t reflect.Type) (*ResponseSpec, error) {
+	if t.Implements(responderType) {
+		spec := reflect.New(t).Elem().Interface().(Responder).Spec()
+		return &spec, nil
+	}
+	if reflect.PointerTo(t).Implements(responderType) {
+		return nil, fmt.Errorf("result type %s implements tork.Responder on *%s, not %s; return a pointer", t, t, t)
+	}
+	return nil, nil
 }
 
 // invoke calls the handler for one request, returning the value it produced
