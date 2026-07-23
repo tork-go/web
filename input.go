@@ -115,24 +115,47 @@ type bodyCheck struct {
 	whole []wholeCheck
 }
 
-// handlerCompiler carries what classifying one handler's parameters needs to
-// know across all of them: which wildcards the route has, and what the
-// parameters already claimed, since a body and a name can each be claimed only
-// once no matter how the input structs are divided up.
-type handlerCompiler struct {
-	route     *Route
-	inj       *injector
-	wildcards map[string]bool
-	claimed   map[string]string
-	bodyFrom  string
-	formFrom  string
+// routeCompiler is the state one route's compilation shares across its
+// dependencies and its handler: the graph to resolve services from, the
+// request-scoped values produced so far and the slot each lives in, and the
+// one body a request has. A dependency and the handler are separate units with
+// their own parameters, but they draw from and add to this together.
+type routeCompiler struct {
+	route  *Route
+	inj    *injector
+	scoped map[reflect.Type]int // request-scoped type → its slot on the exchange
+	slots  int                  // number of request-scoped slots assigned so far
+
+	// bodyFrom and formFrom name whatever already consumed the request body,
+	// across every unit of the route, because the body is read once however
+	// the dependencies and the handler divide up what reads it.
+	bodyFrom string
+	formFrom string
 }
 
-func newHandlerCompiler(route *Route, inj *injector) *handlerCompiler {
+func newRouteCompiler(route *Route, inj *injector) *routeCompiler {
+	return &routeCompiler{
+		route:  route,
+		inj:    inj,
+		scoped: map[reflect.Type]int{},
+	}
+}
+
+// handlerCompiler classifies the parameters of one unit — a dependency or the
+// handler — carrying what is private to that unit: the wildcards its path
+// offers, and the names it has already claimed, since one function cannot read
+// the same parameter into two places. Everything shared across the route
+// reaches it through rc.
+type handlerCompiler struct {
+	rc        *routeCompiler
+	wildcards map[string]bool
+	claimed   map[string]string
+}
+
+func newHandlerCompiler(rc *routeCompiler) *handlerCompiler {
 	return &handlerCompiler{
-		route:     route,
-		inj:       inj,
-		wildcards: wildcardsOf(route.Path),
+		rc:        rc,
+		wildcards: wildcardsOf(rc.route.Path),
 		claimed:   map[string]string{},
 	}
 }
@@ -361,26 +384,28 @@ func addTaggedBody(spec *inputSpec, field reflect.StructField, index []int, raw 
 	return nil
 }
 
-// claimBody records that this handler has its one body.
+// claimBody records that this route has its one body. The claim is on the
+// route rather than the unit, so a dependency and the handler cannot each read
+// the body: the request drains once.
 func (c *handlerCompiler) claimBody(t reflect.Type) error {
-	if c.bodyFrom != "" {
-		return fmt.Errorf("%s is a second request body; %s already is one, and a request has one body", t, c.bodyFrom)
+	if c.rc.bodyFrom != "" {
+		return fmt.Errorf("%s is a second request body; %s already is one, and a request has one body", t, c.rc.bodyFrom)
 	}
-	if c.formFrom != "" {
+	if c.rc.formFrom != "" {
 		return fmt.Errorf("%s is a request body, but field %s already reads the body as a form; "+
-			"a request body is read once", t, c.formFrom)
+			"a request body is read once", t, c.rc.formFrom)
 	}
-	c.bodyFrom = t.String()
+	c.rc.bodyFrom = t.String()
 	return nil
 }
 
-// claimForm records that this handler reads the body as a form.
+// claimForm records that this route reads the body as a form.
 func (c *handlerCompiler) claimForm(field string) error {
-	if c.bodyFrom != "" {
+	if c.rc.bodyFrom != "" {
 		return fmt.Errorf("field %s cannot read a form when %s is already the request body; "+
-			"a request body is read once", field, c.bodyFrom)
+			"a request body is read once", field, c.rc.bodyFrom)
 	}
-	c.formFrom = field
+	c.rc.formFrom = field
 	return nil
 }
 

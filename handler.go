@@ -28,6 +28,14 @@ type handlerPlan struct {
 	// and nil for a handler that returns only an error. It is what the
 	// encoder and the OpenAPI document are built from.
 	result reflect.Type
+
+	// deps are the request-scoped dependencies, in the order they run, and
+	// slots is how many request-scoped values they produce. A request
+	// allocates a slot array of that size and the steps fill it before the
+	// handler is called, so a handler reading an injected request value reads
+	// a slot already written.
+	deps  []depStep
+	slots int
 }
 
 // paramBinder produces one argument for a handler call. Everything a
@@ -55,8 +63,21 @@ func compileHandler(route *Route, inj *injector) (*handlerPlan, error) {
 		return nil, fmt.Errorf("handler is variadic, which leaves the framework nothing to pass")
 	}
 
-	compiler := newHandlerCompiler(route, inj)
+	rc := newRouteCompiler(route, inj)
 	plan := &handlerPlan{fn: fn}
+
+	// The dependencies run before the handler and in the order declared, so
+	// they are compiled first: a later one, or the handler, can then read a
+	// request-scoped value an earlier one produced.
+	for i := range route.dependencies {
+		step, err := compileDep(rc, route.dependencies[i])
+		if err != nil {
+			return nil, err
+		}
+		plan.deps = append(plan.deps, step)
+	}
+
+	compiler := newHandlerCompiler(rc)
 	for i := range fnType.NumIn() {
 		binder, err := compiler.param(fnType.In(i))
 		if err != nil {
@@ -70,6 +91,7 @@ func compileHandler(route *Route, inj *injector) (*handlerPlan, error) {
 		return nil, err
 	}
 	plan.result = result
+	plan.slots = rc.slots
 	route.ResponseSpec = spec
 
 	return plan, nil
@@ -101,9 +123,14 @@ func (c *handlerCompiler) param(t reflect.Type) (paramBinder, error) {
 		return plan.bind, nil
 	}
 
-	if idx, ok := c.inj.singletonIndex[t]; ok {
+	if idx, ok := c.rc.inj.singletonIndex[t]; ok {
 		return func(ex *exchange) (reflect.Value, error) {
 			return ex.srv.singletons[idx], nil
+		}, nil
+	}
+	if slot, ok := c.rc.scoped[t]; ok {
+		return func(ex *exchange) (reflect.Value, error) {
+			return ex.slots[slot], nil
 		}, nil
 	}
 
@@ -169,6 +196,22 @@ func responderSpec(t reflect.Type) (*ResponseSpec, error) {
 		return nil, fmt.Errorf("result type %s implements tork.Responder on *%s, not %s; return a pointer", t, t, t)
 	}
 	return nil, nil
+}
+
+// serveRequest runs the request-scoped dependencies, then the handler.
+//
+// The dependencies run first, in order, and any one of them failing stops the
+// request before the handler — a guard that refuses is meant to, and a value
+// dependency that fails leaves the handler nothing to be called with. Only
+// once they have all run, filling the slots the handler reads from, is the
+// handler itself invoked.
+func (p *handlerPlan) serveRequest(ex *exchange) (any, error) {
+	for i := range p.deps {
+		if err := p.deps[i].run(ex); err != nil {
+			return nil, err
+		}
+	}
+	return p.invoke(ex)
 }
 
 // invoke calls the handler for one request, returning the value it produced

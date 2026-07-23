@@ -172,7 +172,7 @@ func (c *handlerCompiler) compileField(plan *inputPlan, spec *fieldSpec) error {
 
 	if spec.source == sourcePath && !c.wildcards[name] {
 		return fmt.Errorf("field %s reads the path parameter %q, but %s has no {%s} in it",
-			spec.fieldName, name, c.route, name)
+			spec.fieldName, name, c.rc.route, name)
 	}
 	if spec.source == sourceForm {
 		if err := c.claimForm(spec.fieldName); err != nil {

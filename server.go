@@ -41,6 +41,26 @@ type exchange struct {
 	files      map[string][]*multipart.FileHeader
 	formParsed bool
 	formErr    error
+
+	// slots holds the request-scoped dependency values, one per value-
+	// producing dependency on the route, filled by the steps that run before
+	// the handler. cleanups are what those dependencies registered, run in
+	// reverse after the response.
+	slots    []reflect.Value
+	cleanups []Cleanup
+}
+
+// drainCleanups runs the request-scoped cleanups in reverse, after the
+// response. There is nowhere left to report a failing one except the log, the
+// same as any error discovered once the response is already underway.
+func (ex *exchange) drainCleanups(ctx context.Context) {
+	for _, err := range runCleanups(ctx, ex.cleanups) {
+		ex.srv.logger.Error("cleanup failed",
+			"method", ex.request.Method,
+			"path", ex.request.URL.Path,
+			"error", err,
+		)
+	}
 }
 
 // queryValues parses the query string once per request.
@@ -200,13 +220,22 @@ func wrap(handler http.Handler, middleware []Middleware) http.Handler {
 	return handler
 }
 
-// serve is one route's handler: produce the arguments, call the function,
-// write what it returned.
+// serve is one route's handler: run the dependencies, produce the arguments,
+// call the function, write what it returned.
 func (s *server) serve(route *Route) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer s.recoverPanic(w, r)
 
-		result, err := route.plan.invoke(&exchange{writer: w, request: r, srv: s})
+		ex := &exchange{writer: w, request: r, srv: s}
+		if route.plan.slots > 0 {
+			ex.slots = make([]reflect.Value, route.plan.slots)
+		}
+		// Request-scoped cleanups run after the response whatever happened to
+		// it, so a dependency that opened something has it closed even when a
+		// later dependency, or the handler, failed.
+		defer ex.drainCleanups(r.Context())
+
+		result, err := route.plan.serveRequest(ex)
 		if err != nil {
 			s.fail(w, r, err)
 			return

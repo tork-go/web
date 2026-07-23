@@ -18,13 +18,14 @@ import (
 // group a field is in is the whole of the inheritance rule — see inherited.
 type meta struct {
 	// Inherited by everything declared underneath.
-	prefix     string
-	tags       []string
-	middleware []Middleware
-	deprecated bool
-	version    string
-	responses  map[int]ResponseDoc
-	throws     map[reflect.Type]ResponseDoc
+	prefix       string
+	tags         []string
+	middleware   []Middleware
+	dependencies []dependencyDecl
+	deprecated   bool
+	version      string
+	responses    map[int]ResponseDoc
+	throws       map[reflect.Type]ResponseDoc
 
 	// providers is the application-wide provider set. Unlike everything else
 	// in this group it is a pointer to one shared collection rather than a
@@ -62,14 +63,15 @@ type meta struct {
 // map would let the first one's changes appear on the second.
 func (m meta) inherited() meta {
 	return meta{
-		prefix:     m.prefix,
-		tags:       slices.Clone(m.tags),
-		middleware: slices.Clone(m.middleware),
-		deprecated: m.deprecated,
-		version:    m.version,
-		responses:  maps.Clone(m.responses),
-		throws:     maps.Clone(m.throws),
-		providers:  m.providers,
+		prefix:       m.prefix,
+		tags:         slices.Clone(m.tags),
+		middleware:   slices.Clone(m.middleware),
+		dependencies: slices.Clone(m.dependencies),
+		deprecated:   m.deprecated,
+		version:      m.version,
+		responses:    maps.Clone(m.responses),
+		throws:       maps.Clone(m.throws),
+		providers:    m.providers,
 	}
 }
 
@@ -111,6 +113,12 @@ type Route struct {
 	// collide over.
 	Responses map[int]ResponseDoc
 	Throws    map[reflect.Type]ResponseDoc
+
+	// dependencies is the request-scoped chain this route runs, outermost
+	// first: the application's, then each router's, then the route's own. It
+	// is unexported because it is machinery, not description — what it
+	// produces reaches a handler as a parameter.
+	dependencies []dependencyDecl
 
 	// handler is the function as the user wrote it, kept for the generator
 	// and for error messages; plan is what actually runs.
@@ -164,19 +172,20 @@ func (d *declaredRoute) resolve(parent meta) ([]*Route, []error) {
 	}
 
 	return []*Route{{
-		Method:      d.method,
-		Path:        path,
-		OperationID: id,
-		Summary:     m.summary,
-		Description: m.description,
-		Tags:        m.tags,
-		Deprecated:  m.deprecated,
-		Version:     m.version,
-		Responses:   m.responses,
-		Throws:      m.throws,
-		handler:     d.handler,
-		middleware:  m.middleware,
-		site:        d.site,
+		Method:       d.method,
+		Path:         path,
+		OperationID:  id,
+		Summary:      m.summary,
+		Description:  m.description,
+		Tags:         m.tags,
+		Deprecated:   m.deprecated,
+		Version:      m.version,
+		Responses:    m.responses,
+		Throws:       m.throws,
+		dependencies: m.dependencies,
+		handler:      d.handler,
+		middleware:   m.middleware,
+		site:         d.site,
 	}}, errs
 }
 
