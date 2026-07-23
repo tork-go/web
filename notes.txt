@@ -1,0 +1,548 @@
+# Tork Web — implementation prompts, one per phase
+
+Each phase below is a self-contained prompt. Paste one into a fresh session and
+it has everything it needs. Do them in order: C depends on A and B.
+
+- **Phase A — Typed responses** (small, self-contained)
+- **Phase B — Dependency injection** (largest, unblocks real applications)
+- **Phase C — OpenAPI and Swagger UI** (needs A and B)
+- **Phase D — Example application and polish**
+- **Phase E — The generator** (milestone 2)
+
+---
+
+## Shared house rules
+
+These apply to every phase and are repeated inside each prompt so it stands
+alone. If you edit them, edit them everywhere.
+
+- Repo `/home/hasan/Desktop/tork-go/web`, module `github.com/tork-go/web`,
+  package `tork`, Go 1.25.0. Runtime imports **standard library only**.
+- Read `docs/` first — it is accurate and describes exactly what exists.
+- Doc comments explain **why** a thing is shaped the way it is, in prose, not
+  bullet lists. Match the register of the existing files and of
+  `../orm/doc.go`. Never write a comment that only restates the code.
+- Declarations are never validated as they are written. Everything is checked
+  when `app.Handler()` builds, **all mistakes reported together**, each naming
+  the `file:line` it was written on (`callerSite` in `option.go`).
+- Tests live in `tests/`, external package `tork_test`, exercising only the
+  public API. **100% statement coverage is required**: `make cover-report` must
+  print `every statement is covered`. A branch no test can reach through the
+  public API is usually a branch that should not exist — delete it rather than
+  contort a test around it.
+- `gofmt -l .` silent and `go vet ./...` clean before every commit.
+- Docs are Nuxt-content: numbered directories, `title` / `navTitle` /
+  `description` frontmatter. **Document only what exists.** Update the "What is
+  not built yet" list in `docs/1.getting-started/1.introduction.md`.
+- Commit with `git config user.name muzakon` and
+  `user.email hasanmuzak@hotmail.com`. **Never mention Claude, Anthropic, or
+  any AI in a commit message, and never add a Co-Authored-By trailer.** One
+  commit per coherent step; each commit must build and pass tests.
+
+## The architecture you are extending
+
+- `option.go` — `Option` is a closed struct carrying a scope bitmask
+  (`scopeApp`, `scopeRouter`, `scopeRoute`) and the caller's `file:line`.
+  `applyOptions(m *meta, accept scope, label string, opts []Option) []error`
+  folds them and reports misplaced ones.
+- `route.go` — `meta` is every declaration site's state in one struct;
+  `inherited()` decides what a child starts from. `Route` is a finished route.
+- `router.go` — `Router` holds `decls []declaration`; both a route and a
+  mounted router satisfy `resolve(parent meta) ([]*Route, []error)`.
+- `app.go` — `App.build()` applies options, resolves routes, calls
+  `compileHandler(route)` for each, checks uniqueness, then `newServer`.
+- `handler.go` — `handlerPlan{fn, params []paramBinder, result reflect.Type}`.
+  `handlerCompiler.param(t)` classifies a parameter: `context.Context`,
+  `*tork.Request`, a declared input struct, a `JSONBody` struct, else an error.
+  `invoke` gathers `fieldErrors` from every parameter before giving up.
+- `spec.go` — **the single field model.** `fieldSpec` is what both struct tags
+  and the typed builders produce; `compileSpec` turns a declaration into an
+  `inputPlan`. A type-keyed `registry` holds declarations, like the ORM's table
+  registry.
+- `input.go` / `bind.go` — `inputPlan`, `fieldBinder`, `bodyCheck`, and the
+  per-request bind loop.
+- `param.go` / `rule.go` / `builder.go` — typed builders; `rule` is
+  `{issue, message func(name) string, check func(reflect.Value) bool}`;
+  `transform` mutates before rules run.
+- `error.go` — the `Error` envelope, `HTTPError`, `FieldError`, the `Issue*`
+  constants, and `fieldErrors` (a slice that is both an `error` and an
+  `HTTPError`).
+- `server.go` — `exchange` is the per-request state every binder reads from;
+  `server.serve(route)` invokes the plan and writes the result;
+  `server.write(w, r, Error)` completes and serializes a failure.
+- `tests/support_test.go` — `newApp()`, `handlerOf(t, app)`, `do(...)`,
+  `post(...)`, `decodeError`, `decodeFieldErrors`, `buildError`, `bound[T]`,
+  `equalStrings`, `fixedTime`. Reuse these.
+
+## Decisions already taken — do not relitigate
+
+| Decision | |
+|---|---|
+| Error envelope | flat `code`/`message`/`status`/`timestamp`/`path`/`details`; **not** RFC 9457 |
+| Validation failures | **400**, code `VALIDATION_ERROR` |
+| Field naming | parameters location-prefixed (`query.limit`); body fields dotted (`billing.zipCode`), lists indexed (`items[0].sku`) |
+| Two declaration forms | struct tags **and** `DefineInput`/`DefineBody`; a struct picks one |
+| Validation rules | typed builders only; the `validate` tag is not read |
+| Derived wire names | empty tag → lowerCamelCase; header names always explicit |
+| Analysis timing | once at build, never per request |
+| Routing | `net/http.ServeMux`; no router of our own |
+
+---
+
+# Phase A — Typed responses
+
+```
+Work in /home/hasan/Desktop/tork-go/web (module github.com/tork-go/web,
+package tork, Go 1.25.0, standard library only). Read docs/ first — it is
+accurate and describes exactly what exists today.
+
+GOAL
+Let a handler choose the status, headers, and shape of a successful response.
+Today every success is 200 with a JSON body, or 204 when the handler returns
+only an error (see server.serve in server.go). That is the last thing keeping
+handlers from expressing ordinary HTTP.
+
+WHAT TO BUILD
+
+1. A Responder contract in a new response.go. A response type has to answer two
+   different questions at two different times:
+     - statically, at build: which status, which content type, and which Go
+       type its body is — this is what the OpenAPI document will be built from
+       in a later phase, so it must be knowable without a request;
+     - dynamically, per request: write yourself to this ResponseWriter.
+   Design the interface so both are available and cannot disagree. Make it
+   exported so an application can add response types of its own.
+
+2. These response types:
+     tork.OK[T]           200 with a JSON body
+     tork.Created[T]      201, and a Location header when given one
+     tork.Accepted[T]     202
+     tork.NoContent       204, no body
+     tork.Redirect        301/302/303/307/308 with a Location
+     tork.FileResponse    a body from an io.Reader, with a filename that
+                          becomes Content-Disposition, a content type, and a
+                          length when known
+     tork.Stream          a body written by a callback, flushed as it goes
+     tork.RawResponse     bytes with a content type the caller chooses
+   Give each a constructor that reads well at a return statement, e.g.
+   tork.CreatedAt("/items/"+id, item) and tork.File(name, reader).
+
+3. compileResults in handler.go currently reports the success type. Extend it:
+   when the result type implements the Responder contract, the route's status
+   and content type come from the type rather than being assumed. Record this
+   on the route so a later phase can read it. Keep (T, error) and error alone
+   working exactly as they do now — a plain T is still 200 JSON.
+
+4. server.serve writes the result. Route it through the Responder when there is
+   one, and keep writeJSON for a plain T. A response that fails halfway has
+   already sent a status, so document what happens and make the common case
+   (marshal before writing anything) hold wherever it can.
+
+5. Two documentation options, as Option values in option.go:
+     tork.Responds[T](status int, description string)
+     tork.Throws[T]()
+   Both are metadata only — they change nothing at runtime. They are valid on a
+   router and on a route, merge by status code, and a route-level declaration
+   overrides an inherited one. Store them on meta and Route. They exist now so
+   that the OpenAPI phase has them; write the tests that prove they are
+   collected and merged correctly, not that they affect a response.
+
+CONSTRAINTS
+- Nothing may be inspected per request that could be inspected at build.
+- A response type that cannot be understood is a build error naming the
+  handler and the file:line, like every other declaration mistake.
+- Errors keep going through the existing envelope; this phase does not touch
+  error handling.
+
+TESTS (tests/, external package tork_test, reuse the helpers in
+support_test.go)
+- Every response type: status, headers, body.
+- Created with and without a Location.
+- FileResponse: Content-Disposition, content type, and a reader that fails
+  partway.
+- Stream: that it flushes rather than buffering the whole body.
+- Redirect: each status it accepts, and one it does not.
+- A custom application-defined response type, proving the contract is usable
+  from outside the package.
+- Responds/Throws: collected, merged by status, route overriding router.
+- 100% coverage: make cover-report must print "every statement is covered".
+
+DOCS
+Add docs/2.fundamentals/*.md for responses, renumbering as needed and fixing
+every cross-link. Update the "What is not built yet" list in
+docs/1.getting-started/1.introduction.md. Update 2.handlers.md, which currently
+says typed responses are planned but not built.
+
+HOUSE RULES
+- Doc comments explain why, in prose, matching the existing files. Never
+  restate the code.
+- gofmt -l . silent, go vet ./... clean.
+- Commit as muzakon <hasanmuzak@hotmail.com>. Never mention Claude, Anthropic,
+  or any AI in a commit message and never add a Co-Authored-By trailer. One
+  commit per coherent step, each building and passing tests.
+```
+
+---
+
+# Phase B — Dependency injection
+
+```
+Work in /home/hasan/Desktop/tork-go/web (module github.com/tork-go/web,
+package tork, Go 1.25.0, standard library only). Read docs/ first — it is
+accurate and describes exactly what exists today.
+
+GOAL
+Let a handler take the services it needs as ordinary parameters. Today
+handlerCompiler.param in handler.go ends with "cannot supply a value of type X"
+for anything that is not a context, a *tork.Request, or a declared input
+struct, so a service can only be reached through a closure or a global. This is
+the last thing making the framework unable to express a real application.
+
+THE SHAPE, AGREED EARLIER
+Providers ride on the router a feature package already returns, so main.go
+gains nothing:
+
+    func Router() *tork.Router {
+        return tork.NewRouter(
+            tork.Prefix("/items"),
+            tork.Provide(NewRepository, NewService),
+            tork.Depends(auth.RequireToken),
+        )
+    }
+
+    func readItem(
+        ctx context.Context,
+        in ReadItemInput,
+        svc *Service,             // singleton, built once at boot
+        principal auth.Principal, // request-scoped, from Depends
+    ) (ItemResponse, error)
+
+WHAT TO BUILD
+
+1. tork.Provide(constructors ...any) Option, valid on an application and a
+   router. Constructor forms:
+       func(deps...) T
+       func(deps...) (T, error)
+       func(deps...) (T, tork.Cleanup, error)
+   where tork.Cleanup is func(context.Context) error. A constructor's own
+   parameters resolve from the graph, so constructors compose.
+
+2. tork.Depends(fn any) Option, valid on an application, a router, and a route.
+   The function is request-scoped and may take exactly what a handler takes,
+   including declared input structs — run its parameters through the same
+   handlerCompiler.param classification, so a dependency can read a header
+   without inventing a second mechanism. A dependency returning only an error
+   is a guard: it runs for effect and contributes no value.
+
+3. Scopes. Constructors are singletons; Depends functions are request-scoped;
+   transient is opt-in (design the spelling). Enforce at build:
+     - two providers for one type is an error naming both sites;
+     - a cycle is an error printing the whole path,
+       *items.Service -> items.Repository -> *items.Service;
+     - a singleton depending on a request-scoped value is an error;
+     - a handler parameter nothing provides is an error naming the type and
+       suggesting the fix.
+   All of these join the errors app.Handler() already reports together.
+
+4. Compilation, not resolution. Build the graph once, topologically sort it,
+   and give every route a precompiled plan: an ordered list of steps writing
+   into a preallocated slot array on the exchange, with slot indices assigned
+   at build. At request time there must be no type-keyed map lookup, no
+   re-resolution, and no cycle checking. Caching falls out of the plan — a slot
+   is filled exactly once per request.
+
+5. Singletons are constructed once, when the application builds, and held in a
+   fixed slice, so a handler needing *items.Service reads a pointer. Fifty
+   services must cost nothing per request. Cleanups registered by providers run
+   in reverse order: request-scoped ones after the response, singletons when
+   the application shuts down — give App a way to do that and wire it into
+   Serve/ServeListener.
+
+6. Ordering. Dependencies declared further out run first
+   (application, then router, then route), because an inner one may rely on
+   what an outer one established.
+
+7. A dependency that returns an error stops the handler, and that error goes
+   through the existing envelope machinery unchanged — an HTTPError answers for
+   itself, a mapper can translate it, anything else is a 500.
+
+DESIGN QUESTIONS TO SETTLE AND DOCUMENT
+- Whether a provider declared on one router is visible application-wide or only
+  underneath that router. Assume application-wide unless you find a reason not
+  to, and report a duplicate provider as an error naming both sites.
+- How an interface with two implementations is resolved. The intended answer is
+  a distinct named wrapper type, never a string name — document it.
+- Whether singletons are built eagerly at Handler() or lazily on first use.
+  Prefer eager: a missing database should fail at boot, not on the first
+  request that needs it.
+
+TESTS (tests/, external package tork_test, reuse the helpers in
+support_test.go)
+- Graph shapes: a chain, a diamond, a cycle, a missing provider, a duplicate
+  provider, a scope violation.
+- A singleton is constructed exactly once under concurrent requests — run this
+  with -race.
+- Request-scoped values are constructed once per request and shared within it.
+- Cleanup order is LIFO, and cleanups run even when the handler fails.
+- A dependency that returns an error: its status is served, the handler never
+  ran.
+- A dependency that reads a header through its own input struct.
+- Nested dependencies, and a dependency used by two handlers.
+- Outermost-first ordering across application, router, and route.
+- 100% coverage: make cover-report must print "every statement is covered".
+
+BENCHMARK
+Add tests/bench: a handler taking a path parameter, a query parameter, a body,
+and two dependencies, measured against the equivalent bare net/http handler.
+This is the number that keeps the "no per-request reflection" claim honest.
+Report ns/op and allocs/op in the commit message.
+
+DOCS
+Add docs/2.fundamentals/*.md for dependencies — providers, Depends, scopes,
+cleanup, and every build error with its message. Renumber and fix cross-links.
+Update the "What is not built yet" list. Update 2.handlers.md, whose parameter
+classification list currently says a dependency is a build error, and
+12.middleware.md, which says dependencies will be the better place for
+authorization.
+
+HOUSE RULES
+- Doc comments explain why, in prose, matching the existing files.
+- Everything is checked at build, all mistakes reported together, each naming
+  its file:line.
+- gofmt -l . silent, go vet ./... clean.
+- Commit as muzakon <hasanmuzak@hotmail.com>. Never mention Claude, Anthropic,
+  or any AI in a commit message and never add a Co-Authored-By trailer. One
+  commit per coherent step, each building and passing tests.
+```
+
+---
+
+# Phase C — OpenAPI and Swagger UI
+
+```
+Work in /home/hasan/Desktop/tork-go/web (module github.com/tork-go/web,
+package tork, Go 1.25.0, standard library only for the runtime). Read docs/
+first. Phases A (typed responses) and B (dependency injection) must be done.
+
+GOAL
+Serve an OpenAPI 3.1.2 document and a Swagger UI built from what is already
+declared. Nothing new should have to be written to describe an API — the route
+model, the field model, the response types, and the dependencies already hold
+everything.
+
+WHAT TO BUILD
+
+1. A new openapi/ package holding the document model as plain Go structs, a
+   JSON Schema builder, and emitters. It must know nothing about routes,
+   handlers, or this framework — it is "OpenAPI as Go types, plus a way to
+   write them out", so that a 3.2 emitter can join it later without touching
+   anything else. Hand-roll the YAML emitter; a specification document needs a
+   narrow subset and it is not worth a dependency.
+
+2. A schema builder from reflect.Type: named struct types become entries under
+   $defs and are referenced with $ref, anonymous ones inline. It must be cycle
+   safe. Honour json tags, omitempty, omitzero, and tork.Optional[T] — an
+   Optional field is nullable and not required.
+
+3. A builder in package tork that turns Routes() into a document:
+     path and method            from the route
+     summary                    from tork.Summary, or the first sentence of the
+                                handler's doc comment if you can get it without
+                                parsing source — if not, leave it to the option
+     description                from tork.Description
+     tags, deprecated,
+       operationId              from the route
+     parameters                 from the field model, in: path/query/header/
+                                cookie, including those a dependency declares
+     requestBody                from the body spec, including form and
+                                multipart
+     success responses          from the response types added in phase A
+     error responses            from tork.Responds[T] and tork.Throws[T]
+     security                   from authentication dependencies
+
+4. VALIDATION RULES MUST REACH THE SCHEMA. This is a real gap you have to
+   close: the rule type in rule.go carries an issue, a message, and a check,
+   but no schema contribution, so today a Min(1) cannot become "minimum": 1.
+   Extend rule so every rule carries the JSON Schema keyword it stands for, and
+   fill it in for every rule in param.go: Min/Max, MinLen/MaxLen, Len, Pattern,
+   OneOf (enum), MultipleOf, MinItems/MaxItems, Unique (uniqueItems), Email,
+   UUID, URL and the other formats (format), Required. A rule that cannot be
+   expressed in JSON Schema — a custom Check — contributes nothing, and that is
+   fine, but make it deliberate rather than accidental.
+   Test each rule's runtime behaviour and its emitted keyword together, in one
+   test, so the two cannot drift.
+
+5. A docsui/ package embedding a pinned swagger-ui-dist under embed.FS, with
+   its Apache-2.0 notice vendored. Never load from a CDN. Pin the version in a
+   constant and say why in a comment.
+
+6. Endpoints, registered by the server:
+     /openapi.json  /openapi.yaml  /docs          the default version
+     /openapi/v1.json  /docs/v1                   each declared version
+   Each API version declared with app.Version gets an independent document.
+   Make the paths configurable through the existing tork.OpenAPI option shape
+   from the original design, and make them not collide with a user's routes.
+
+CONSTRAINTS
+- Documents are built once, when the application builds, not per request.
+- The document must be deterministic: same application, byte-identical output.
+  Sort anything that comes out of a map.
+- An operation that cannot be described is a build error, not a silent gap.
+
+TESTS
+- Golden JSON and YAML documents for a reference application covering every
+  parameter source, both body forms, forms and uploads, every response type,
+  declared errors, and dependencies. The diff is how a change to the emitter
+  gets reviewed; add a make target that rewrites the goldens, like the ORM's.
+- Each validation rule's keyword, asserted beside its runtime behaviour.
+- Schema builder: nested structs, slices, maps, pointers, Optional, embedded
+  structs, recursive types.
+- Per-version documents are independent, and an operation ID may repeat across
+  versions.
+- Determinism: build twice, compare bytes.
+- 100% coverage: make cover-report must print "every statement is covered".
+
+END-TO-END VERIFICATION
+Run the example application and open /docs. Swagger UI must render every
+operation with its parameters, request bodies, and both success and declared
+error schemas, and "Try it out" must succeed against the live server. That
+round trip is the real acceptance test: it proves the route model, the field
+model, and the document are the same model.
+
+DOCS
+Add a docs/3.openapi/ section: what is generated from what, the endpoints,
+versioning, how to describe an error, and what is not covered. Update the "What
+is not built yet" list.
+
+HOUSE RULES
+- Doc comments explain why, in prose, matching the existing files.
+- gofmt -l . silent, go vet ./... clean.
+- Commit as muzakon <hasanmuzak@hotmail.com>. Never mention Claude, Anthropic,
+  or any AI in a commit message and never add a Co-Authored-By trailer.
+```
+
+---
+
+# Phase D — Example application and polish
+
+```
+Work in /home/hasan/Desktop/tork-go/web. Read docs/ first. Phases A, B, and C
+should be done.
+
+GOAL
+Prove the framework on something the size of a real application, and clear the
+sharp edges found along the way.
+
+WHAT TO BUILD
+
+1. examples/api — the application from the original design: users, items, and
+   an admin router, versioned under /api/v1, with a feature package per domain
+   holding its own request types, handlers, providers, and Router(). It must
+   use every part of the framework: both declaration forms, all five parameter
+   sources, JSON bodies, a form with an upload, Optional fields on a PATCH,
+   validation including a nested document and a cross-field check, typed
+   responses including 201 with a Location and a file download, a domain error
+   implementing HTTPError, an error mapper, dependencies at three levels, and a
+   declared API version. It is built and served in CI, and it is what the
+   golden OpenAPI document is generated from.
+
+2. Make an unrecognised validate tag a build error. Today a field carrying
+   validate:"required" is silently ignored — nothing reads that tag name — so
+   anyone arriving from go-playground/validator or FastAPI gets a rule that
+   does nothing. Report it, and point at DefineInput.
+
+3. Widen the typed builders to the types they do not yet cover: pointer fields,
+   encoding.TextUnmarshaler types, and uploaded files. These currently force a
+   struct back to tags. Keep the surface honest — if a type cannot carry
+   meaningful rules, it still needs a way to be declared.
+
+4. A README for the repository: what it is, the smallest useful example, a link
+   into docs/, and what is not built yet.
+
+5. Review the whole public API for names that no longer fit, options that
+   should have been on a different scope, and errors whose message does not say
+   the fix. This is the last comfortable moment before the surface is stable.
+
+TESTS
+- The example application's own tests, through app.Handler().
+- The validate-tag build error.
+- The newly supported builder types, bound and judged.
+- 100% coverage stays at 100%.
+
+DOCS
+Update every page the polish touched. Add a getting-started page walking
+through examples/api.
+
+HOUSE RULES
+- gofmt -l . silent, go vet ./... clean.
+- Commit as muzakon <hasanmuzak@hotmail.com>. Never mention Claude, Anthropic,
+  or any AI in a commit message and never add a Co-Authored-By trailer.
+```
+
+---
+
+# Phase E — The generator (milestone 2)
+
+```
+Work in /home/hasan/Desktop/tork-go/web. Milestone 1 must be complete. Read
+docs/ and the sibling ../orm/gen/ first — this mirrors its structure.
+
+GOAL
+Replace the startup reflection with generated Go, and turn the runtime's build
+errors into compile-time diagnostics. The runtime stays the definition of what
+the generated code must do; the generator is an optimisation and an earlier
+warning, never a second source of truth.
+
+STRUCTURE, MIRRORING ../orm/gen/
+  gen/diag     Diagnostic, Severity, Sort, HasErrors, "file:line:col: message"
+               rendering. A near-copy of orm/gen/diag/diag.go retargeted at
+               go/token.
+  gen/analyze  Loads packages with golang.org/x/tools/go/packages — the only
+               third-party dependency, and it must never reach the runtime
+               module graph. Walks route declarations, handler signatures,
+               input structs, DefineInput/DefineBody calls, and constructors.
+               Builds the same route, field, and graph model the runtime builds,
+               statically.
+  gen/codegen  Emits zz_tork_routes.gen.go, _handlers, _bindings, _validation,
+               _di, _openapi: typed adapters, direct field assignments with no
+               reflection at all, straight-line dependency construction, and
+               the precomputed OpenAPI document. Header
+               "// Code generated by tork. DO NOT EDIT.", formatted through
+               go/format — which doubles as the parse check.
+  gen/cli      generate (the default) and check, shipped as a library like
+               orm/gen/cli/cli.go: Run(cfg) int, exit codes 0 success, 1 bad
+               input, 2 usage, driven by a small main.go in the user's project.
+
+DISCOVERY
+Find NewX constructors in each package so tork.Provide becomes optional. This
+is the payoff that made the runtime-first ordering worth it: the declaration
+stays where it was, and the list stops being written by hand.
+
+DIAGNOSTICS TO SHIP
+Every build error the runtime already produces, moved earlier: a path field
+with no matching wildcard, an unknown validation rule, a duplicate operation
+ID, multiple providers for a type, a dependency cycle with the path printed, a
+missing provider, a scope violation, an undeclared field.
+
+HANDOVER
+Generated files register themselves in init() with a fingerprint of the route
+set. The runtime uses them when the fingerprint matches, and otherwise falls
+back to startup reflection with a warning naming the stale operation.
+tork.RequireGenerated() turns that warning into a startup error for production
+builds.
+
+TESTS
+- Golden generated files, with a make target that rewrites them — the diff is
+  how a codegen change gets reviewed, exactly as in the ORM.
+- Every diagnostic, asserted on message and position.
+- The generated adapters and the reflection runtime must agree: run the same
+  request suite against both and compare responses byte for byte. This is the
+  most important test in the phase.
+- The benchmark from phase B must improve.
+- CI shape: go run ./cmd/generate ./... && git diff --exit-code && go test ./...
+
+HOUSE RULES
+- gofmt -l . silent, go vet ./... clean, 100% coverage.
+- Commit as muzakon <hasanmuzak@hotmail.com>. Never mention Claude, Anthropic,
+  or any AI in a commit message and never add a Co-Authored-By trailer.
+```
