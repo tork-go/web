@@ -3,6 +3,7 @@ package tork
 import (
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -170,6 +171,45 @@ func OperationID(id string) Option {
 func Deprecated() Option {
 	return newOption("Deprecated", scopeRouter|scopeRoute, func(m *meta) error {
 		m.deprecated = true
+		return nil
+	})
+}
+
+// Responds documents a response an operation may answer with beyond what
+// its result type already says on its own — a status a handler or a
+// dependency chooses at runtime, or an error response whose shape is worth
+// naming even though tork.Throws would name it too. It changes nothing at
+// runtime; the OpenAPI phase reads it.
+//
+// Declared on a router, it documents every route underneath; declared again
+// on a route for the same status, the route's own description replaces the
+// router's, the same way every inherited field a route redeclares does.
+func Responds[T any](status int, description string) Option {
+	return newOption("Responds", scopeRouter|scopeRoute, func(m *meta) error {
+		if m.responses == nil {
+			m.responses = map[int]ResponseDoc{}
+		}
+		m.responses[status] = ResponseDoc{Status: status, Type: reflect.TypeFor[T](), Description: description}
+		return nil
+	})
+}
+
+// Throws documents an error shape an operation may answer with, for a
+// domain error a handler or a dependency returns rather than one the
+// framework already knows about. It changes nothing at runtime; the
+// OpenAPI phase reads it.
+//
+// Declaring the same type twice, on a router and on a route beneath it or
+// twice at the same site, is not a mistake: an operation legitimately fails
+// in more than one way, and Throws has no status for two declarations to
+// collide over the way Responds does — it simply accumulates.
+func Throws[T any]() Option {
+	return newOption("Throws", scopeRouter|scopeRoute, func(m *meta) error {
+		if m.throws == nil {
+			m.throws = map[reflect.Type]ResponseDoc{}
+		}
+		t := reflect.TypeFor[T]()
+		m.throws[t] = ResponseDoc{Type: t}
 		return nil
 	})
 }

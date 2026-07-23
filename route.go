@@ -3,6 +3,8 @@ package tork
 import (
 	"fmt"
 	"log/slog"
+	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -21,6 +23,8 @@ type meta struct {
 	middleware []Middleware
 	deprecated bool
 	version    string
+	responses  map[int]ResponseDoc
+	throws     map[reflect.Type]ResponseDoc
 
 	// Belonging to one operation, and never inherited. A summary that
 	// applied to every route under a router would be wrong on all but the
@@ -44,9 +48,10 @@ type meta struct {
 // inherited returns what a child declaration starts from: the inheritable
 // fields, and none of the per-operation ones.
 //
-// The slices are cloned rather than shared. Two routers included into the
-// same parent both append to the tags they inherited, and appending to a
-// shared backing array would let the first one's tags appear on the second.
+// The slices and maps are cloned rather than shared. Two routers included
+// into the same parent both append to the tags — and add to the responses
+// and throws — they inherited, and writing into a shared backing array or
+// map would let the first one's changes appear on the second.
 func (m meta) inherited() meta {
 	return meta{
 		prefix:     m.prefix,
@@ -54,6 +59,8 @@ func (m meta) inherited() meta {
 		middleware: slices.Clone(m.middleware),
 		deprecated: m.deprecated,
 		version:    m.version,
+		responses:  maps.Clone(m.responses),
+		throws:     maps.Clone(m.throws),
 	}
 }
 
@@ -87,6 +94,14 @@ type Route struct {
 	// at build and read by nothing at request time — it exists for the
 	// OpenAPI phase to build a document from without a request.
 	ResponseSpec *ResponseSpec
+	// Responses and Throws are what Responds and Throws declared on this
+	// route and everything it inherited from, merged the same way every
+	// other inherited field is: a route-level Responds for a status a
+	// router already declared replaces the router's, and Throws simply
+	// accumulates, since there is no status for two declarations of it to
+	// collide over.
+	Responses map[int]ResponseDoc
+	Throws    map[reflect.Type]ResponseDoc
 
 	// handler is the function as the user wrote it, kept for the generator
 	// and for error messages; plan is what actually runs.
@@ -148,6 +163,8 @@ func (d *declaredRoute) resolve(parent meta) ([]*Route, []error) {
 		Tags:        m.tags,
 		Deprecated:  m.deprecated,
 		Version:     m.version,
+		Responses:   m.responses,
+		Throws:      m.throws,
 		handler:     d.handler,
 		middleware:  m.middleware,
 		site:        d.site,

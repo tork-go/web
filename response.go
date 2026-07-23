@@ -30,6 +30,26 @@ type ResponseSpec struct {
 	BodyType reflect.Type
 }
 
+// ResponseDoc is one entry Responds or Throws recorded: a response an
+// operation may answer with beyond what its result type's own ResponseSpec
+// already says. It changes nothing at runtime — the OpenAPI phase reads it
+// off Route.Responses and Route.Throws to describe what compileResults
+// cannot see for itself, such as a status chosen dynamically or an error a
+// dependency throws rather than the handler returning.
+type ResponseDoc struct {
+	// Status is the status this response answers with. Zero for a Throws
+	// entry, which documents a shape rather than one status — the shape's
+	// own HTTPError answers for its status, and may answer differently
+	// depending on how it was constructed.
+	Status int
+	// Type is the Go type of the response's body, or of the error itself
+	// for a Throws entry.
+	Type reflect.Type
+	// Description explains the response for a person reading the
+	// documentation. Empty for a Throws entry, which names its type instead.
+	Description string
+}
+
 // Responder is a value that decides its own status, headers, and body,
 // instead of leaving compileResults to assume 200 JSON.
 //
