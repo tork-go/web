@@ -4,7 +4,7 @@
 # these: tests live under tests/, outside the packages they exercise, so
 # -coverpkg is required. Without it, go test has no local package to
 # instrument and reports "no statements" instead of real coverage.
-PRODUCT_PKGS := github.com/tork-go/web
+PRODUCT_PKGS := github.com/tork-go/web,github.com/tork-go/web/openapi
 
 test:
 	go test ./tests/...
