@@ -310,3 +310,83 @@ func (f FileResponse) WriteResponse(w http.ResponseWriter, _ *http.Request) erro
 	_, err := io.Copy(w, f.Reader)
 	return err
 }
+
+// Stream is a body produced by a callback and sent as it is written, rather
+// than assembled first the way every other response here is — the shape for
+// a body too large to hold in memory at once, or one whose next chunk is not
+// ready until the last one has already gone out.
+//
+//	func tailLog(ctx context.Context, in TailInput) (tork.Stream, error) {
+//	    return tork.Streamed("text/plain", func(w io.Writer) error {
+//	        return followLog(ctx, in.Path, w)
+//	    }), nil
+//	}
+type Stream struct {
+	// ContentType is the response's Content-Type.
+	ContentType string
+	// Status is the response's status code. Zero resolves to 200.
+	Status int
+	// Write produces the body. It is called once, given a writer that
+	// flushes after every write the underlying connection can flush at all,
+	// so the body reaches the client as it is produced instead of only once
+	// Write returns.
+	Write func(w io.Writer) error
+}
+
+// Streamed builds a Stream under the given content type.
+func Streamed(contentType string, write func(w io.Writer) error) Stream {
+	return Stream{ContentType: contentType, Write: write}
+}
+
+// WithStatus replaces the status and returns the response.
+func (s Stream) WithStatus(status int) Stream {
+	s.Status = status
+	return s
+}
+
+// resolvedStatus is the status Stream actually answers with. See
+// Response.resolvedStatus for why Spec and WriteResponse share it.
+func (s Stream) resolvedStatus() int {
+	if s.Status == 0 {
+		return http.StatusOK
+	}
+	return s.Status
+}
+
+// Spec reports the default status, 200, for the same reason Response's
+// does. ContentType is left unset for the same reason RawResponse's is:
+// Spec is only ever asked about a zero-valued Stream, and there is no
+// default content type to fall back to the way there is for status.
+func (s Stream) Spec() ResponseSpec {
+	return ResponseSpec{Status: s.resolvedStatus()}
+}
+
+// WriteResponse writes the status and content type once, then calls Write
+// with a writer that flushes after every call when the connection
+// underneath it can — a plain passthrough when it cannot, which is a
+// fallback rather than a failure: a body that cannot be flushed early is
+// still a complete body once Write returns.
+func (s Stream) WriteResponse(w http.ResponseWriter, _ *http.Request) error {
+	if s.ContentType != "" {
+		w.Header().Set("Content-Type", s.ContentType)
+	}
+	w.WriteHeader(s.resolvedStatus())
+	flusher, _ := w.(http.Flusher)
+	return s.Write(flushingWriter{w: w, flusher: flusher})
+}
+
+// flushingWriter flushes after every write when it can, which is what makes
+// a Stream arrive as it is produced instead of buffered behind the
+// handler's return.
+type flushingWriter struct {
+	w       io.Writer
+	flusher http.Flusher
+}
+
+func (f flushingWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if f.flusher != nil {
+		f.flusher.Flush()
+	}
+	return n, err
+}

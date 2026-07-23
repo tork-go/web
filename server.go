@@ -191,8 +191,8 @@ func (s *server) serve(route *Route) http.Handler {
 			// envelope writeJSON's own failures do; one that fails partway
 			// through a body already begun can only be logged, because the
 			// status line is already on the wire.
-			tracker := trackResponse(w)
-			if err := resp.WriteResponse(tracker, r); err != nil {
+			tracked, tracker := trackResponse(w)
+			if err := resp.WriteResponse(tracked, r); err != nil {
 				if tracker.started {
 					s.logger.Error("cannot write response", "method", r.Method, "path", r.URL.Path, "error", err)
 				} else {
@@ -212,10 +212,6 @@ func (s *server) serve(route *Route) http.Handler {
 // begun, which is the one thing serve needs to know about a Responder that
 // failed and cannot know any other way: net/http's ResponseWriter has no
 // method that answers "has anything been sent yet".
-//
-// A Responder that also needs to flush — Stream does — gets a tracker that
-// preserves http.Flusher too; nothing before it does, so there is nothing
-// here yet for that tracker to wrap.
 type responseTracker struct {
 	http.ResponseWriter
 	started bool
@@ -231,10 +227,32 @@ func (t *responseTracker) Write(b []byte) (int, error) {
 	return t.ResponseWriter.Write(b)
 }
 
+// flushingResponseTracker is a responseTracker for an underlying
+// ResponseWriter that can flush.
+//
+// It exists so that tracking whether a response has begun never costs a
+// Responder the ability to stream: without it, wrapping w in a plain
+// responseTracker would hide http.Flusher from Stream even when the real
+// ResponseWriter underneath supports it.
+type flushingResponseTracker struct {
+	*responseTracker
+	flusher http.Flusher
+}
+
+func (t *flushingResponseTracker) Flush() {
+	t.started = true
+	t.flusher.Flush()
+}
+
 // trackResponse wraps w so the caller can learn, after the fact, whether
-// anything reached the client.
-func trackResponse(w http.ResponseWriter) *responseTracker {
-	return &responseTracker{ResponseWriter: w}
+// anything reached the client. The returned ResponseWriter is what a
+// Responder writes to; the returned tracker is what serve reads back.
+func trackResponse(w http.ResponseWriter) (http.ResponseWriter, *responseTracker) {
+	base := &responseTracker{ResponseWriter: w}
+	if flusher, ok := w.(http.Flusher); ok {
+		return &flushingResponseTracker{responseTracker: base, flusher: flusher}, base
+	}
+	return base, base
 }
 
 // recoverPanic turns a panicking handler into an internal error.

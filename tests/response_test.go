@@ -1,9 +1,12 @@
 package tork_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -438,6 +441,163 @@ func TestRouteResponseSpecForFileResponseHasNoContentTypeOrBodyType(t *testing.T
 	app := newApp()
 	app.GET("/download", func(context.Context) (tork.FileResponse, error) {
 		return tork.File("report.pdf", strings.NewReader("")), nil
+	})
+
+	routes, err := app.Routes()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	spec := routes[0].ResponseSpec
+	if spec == nil {
+		t.Fatal("ResponseSpec is nil")
+	}
+	if spec.Status != http.StatusOK {
+		t.Errorf("status = %d, want the documented default 200", spec.Status)
+	}
+	if spec.ContentType != "" {
+		t.Errorf("content type = %q, want empty since it is unknown before a request", spec.ContentType)
+	}
+	if spec.BodyType != nil {
+		t.Errorf("body type = %v, want nil", spec.BodyType)
+	}
+}
+
+// recordingFlusher is a minimal http.ResponseWriter and http.Flusher that
+// records the order writes and flushes happen in — the one thing
+// httptest.ResponseRecorder cannot show, since its own Flush only sets a
+// bool rather than recording when it was called.
+type recordingFlusher struct {
+	header http.Header
+	status int
+	calls  []string
+}
+
+func newRecordingFlusher() *recordingFlusher {
+	return &recordingFlusher{header: http.Header{}}
+}
+
+func (w *recordingFlusher) Header() http.Header { return w.header }
+
+func (w *recordingFlusher) WriteHeader(status int) { w.status = status }
+
+func (w *recordingFlusher) Write(p []byte) (int, error) {
+	w.calls = append(w.calls, "write:"+string(p))
+	return len(p), nil
+}
+
+func (w *recordingFlusher) Flush() {
+	w.calls = append(w.calls, "flush")
+}
+
+func TestStreamFlushesAfterEveryWrite(t *testing.T) {
+	app := newApp()
+	app.GET("/", func(context.Context) (tork.Stream, error) {
+		return tork.Streamed("text/plain", func(w io.Writer) error {
+			if _, err := w.Write([]byte("a")); err != nil {
+				return err
+			}
+			_, err := w.Write([]byte("b"))
+			return err
+		}), nil
+	})
+
+	rec := newRecordingFlusher()
+	handlerOf(t, app).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+
+	want := []string{"write:a", "flush", "write:b", "flush"}
+	if !equalStrings(rec.calls, want) {
+		t.Errorf("calls = %v, want %v", rec.calls, want)
+	}
+	if rec.status != http.StatusOK {
+		t.Errorf("status = %d", rec.status)
+	}
+	if got := rec.header.Get("Content-Type"); got != "text/plain" {
+		t.Errorf("content type = %q", got)
+	}
+}
+
+// plainWriter is a minimal http.ResponseWriter with no Flush method, for
+// proving Stream still writes correctly against a connection that cannot
+// flush early.
+type plainWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func newPlainWriter() *plainWriter { return &plainWriter{header: http.Header{}} }
+
+func (w *plainWriter) Header() http.Header { return w.header }
+
+func (w *plainWriter) WriteHeader(status int) { w.status = status }
+
+func (w *plainWriter) Write(p []byte) (int, error) { return w.body.Write(p) }
+
+func TestStreamWritesWithoutFlushingWhenTheConnectionCannot(t *testing.T) {
+	app := newApp()
+	app.GET("/", func(context.Context) (tork.Stream, error) {
+		return tork.Streamed("text/plain", func(w io.Writer) error {
+			_, err := w.Write([]byte("hello"))
+			return err
+		}), nil
+	})
+
+	rec := newPlainWriter()
+	handlerOf(t, app).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+
+	if rec.status != http.StatusOK {
+		t.Errorf("status = %d", rec.status)
+	}
+	if rec.body.String() != "hello" {
+		t.Errorf("body = %q", rec.body.String())
+	}
+}
+
+func TestStreamWithStatusReplacesTheDefault(t *testing.T) {
+	app := newApp()
+	app.GET("/", func(context.Context) (tork.Stream, error) {
+		return tork.Streamed("text/plain", func(w io.Writer) error {
+			_, err := w.Write([]byte("queued"))
+			return err
+		}).WithStatus(http.StatusAccepted), nil
+	})
+
+	rec := do(t, app, "GET", "/", nil)
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("status = %d", rec.Code)
+	}
+	if rec.Body.String() != "queued" {
+		t.Errorf("body = %q", rec.Body)
+	}
+}
+
+// A callback that fails partway has already sent headers and some of the
+// body, so — like FileResponse's reader — the response is only ever what it
+// managed to send before the failure.
+func TestStreamCallbackFailingPartwayIsOnlyLogged(t *testing.T) {
+	app := newApp()
+	app.GET("/", func(context.Context) (tork.Stream, error) {
+		return tork.Streamed("text/plain", func(w io.Writer) error {
+			if _, err := w.Write([]byte("partial")); err != nil {
+				return err
+			}
+			return errors.New("stream failed")
+		}), nil
+	})
+
+	rec := do(t, app, "GET", "/", nil)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want the status already sent before the callback failed", rec.Code)
+	}
+	if rec.Body.String() != "partial" {
+		t.Errorf("body = %q, want only what was written before the failure", rec.Body.String())
+	}
+}
+
+func TestRouteResponseSpecForStream(t *testing.T) {
+	app := newApp()
+	app.GET("/", func(context.Context) (tork.Stream, error) {
+		return tork.Streamed("text/plain", func(io.Writer) error { return nil }), nil
 	})
 
 	routes, err := app.Routes()
